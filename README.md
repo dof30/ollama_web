@@ -93,6 +93,26 @@ Architecture: `webapp/engine.py` runs the ReAct loop as an *event stream*;
 untouched and still works for quick terminal tests. Audio in/out is the next
 phase. Env vars: `RESEARCH_WEB_PORT` (default 8765), `RESEARCH_WEB_HOST`.
 
+## Session history (locked away, terminal-only)
+
+Every finished web-UI turn (question, answer, sources fetched, model, timing) is
+recorded to a local SQLite DB at `~/.local/share/research-web/history.db` — but
+**deliberately never shown in the web UI**. The server only writes to it; there
+is no HTTP route that reads it, so nothing that can reach the port can pull your
+history back out. The DB lives outside the repo and the served directory, with
+owner-only permissions (dir `0700`, file `0600`). Check back whenever you like:
+
+```bash
+python3 webapp/history.py            # last 20 turns, one line each
+python3 webapp/history.py show 12    # full record: question, answer, sources
+python3 webapp/history.py search oled
+python3 webapp/history.py stats      # where the DB is, size, perms, counts
+python3 webapp/history.py purge --days 90   # or --all; VACUUMs so text is really gone
+```
+
+Set `RESEARCH_HISTORY=0` to disable recording; `RESEARCH_HISTORY_DB=/path` to
+move it. Recording is best-effort — a history failure can never break a run.
+
 ## Tuning (all optional, via env vars)
 
 | var | default | meaning |
@@ -103,6 +123,8 @@ phase. Env vars: `RESEARCH_WEB_PORT` (default 8765), `RESEARCH_WEB_HOST`.
 | `RESEARCH_MIN_SOURCES` | `0` | forced depth gate; `0` = off, model matches effort to the question (`--deep` sets 5) |
 | `RESEARCH_FETCH_CHARS` | `6000` | chars kept per fetched page |
 | `RESEARCH_MAX_HISTORY_TURNS` | `8` | past Q/A turns kept per web session (see below) |
+| `RESEARCH_HISTORY` | `1` | `0` disables the session-history recorder |
+| `RESEARCH_HISTORY_DB` | `~/.local/share/research-web/history.db` | where the history DB lives |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint |
 
 **Why a session doesn't overflow:** during a turn the model reads whole pages

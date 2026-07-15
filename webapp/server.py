@@ -13,11 +13,13 @@ whole run is visible live. Runs on localhost only.
 import json
 import os
 import sys
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import engine  # noqa: E402
+import history  # noqa: E402  (write-only recorder; no HTTP route ever reads it)
 
 HOST = os.environ.get("RESEARCH_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("RESEARCH_WEB_PORT", "8765"))
@@ -102,10 +104,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         final_text = ""
+        sources = []
+        t0 = time.time()
         try:
             for ev in engine.research_events(model, messages, min_sources=depth):
                 if ev.get("type") == "final":
                     final_text = ev.get("text", "")
+                elif ev.get("type") == "source":
+                    sources.append(ev.get("url", ""))
                 frame = "data: " + json.dumps(ev) + "\n\n"
                 self.wfile.write(frame.encode("utf-8"))
                 self.wfile.flush()
@@ -115,6 +121,10 @@ class Handler(BaseHTTPRequestHandler):
             # Shrink this turn back to a clean Q+A so the next turn starts lean and
             # the session can't overflow the context window over a long conversation.
             engine.compact_turn(messages, base_len, question, final_text)
+            # Lock the finished turn away in the local history DB (write-only from
+            # here; read it later with `python3 webapp/history.py`).
+            history.record(sid, model, depth, question, final_text,
+                           sources, time.time() - t0)
 
 
 def main():

@@ -163,13 +163,21 @@ async function loadModels(){
 // Follow the stream only while the user is parked at the bottom. As soon as they
 // scroll up to read something mid-generation, stop yanking the view down; a "↓ latest"
 // button appears, and scrolling back to the bottom (or clicking it) resumes following.
-let stick = true;
+let stick = true, lastTop = 0;
 convo.addEventListener("scroll", () => {
-  stick = convo.scrollTop + convo.clientHeight >= convo.scrollHeight - 80;
+  const top = convo.scrollTop;
+  const atBottom = top + convo.clientHeight >= convo.scrollHeight - 80;
+  // Direction, not just position: the moment the user pushes the view UP we let
+  // go and stop following, even if still near the bottom. We only re-follow once
+  // they've come back down to the bottom. Programmatic scrolls only ever move
+  // DOWN, so they can never trip the "user scrolled up" branch and yank the view.
+  if(top < lastTop - 2) stick = false;
+  else if(atBottom) stick = true;
+  lastTop = top;
   jump.classList.toggle("show", !stick);
 });
-function scrollDown(){ if(stick) convo.scrollTop = convo.scrollHeight; }
-function stickToBottom(){ stick = true; convo.scrollTop = convo.scrollHeight; jump.classList.remove("show"); }
+function scrollDown(){ if(stick){ convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop; } }
+function stickToBottom(){ stick = true; convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop; jump.classList.remove("show"); }
 jump.onclick = stickToBottom;
 
 // ---- one Q/A turn ----
@@ -317,16 +325,36 @@ function handle(ctx, ev){
 }
 
 // ---- wiring ----
+// Shell-style command history: Up/Down cycle through prior questions.
+const history=[]; let hIdx=0, draft="";
 function send(){
   const q=$("#q").value.trim(); if(!q) return;
+  if(history[history.length-1]!==q) history.push(q);  // no consecutive dupes
+  hIdx=history.length; draft="";
   $("#q").value=""; $("#q").style.height="44px"; stick=true; ask(q);
 }
+function autosize(el){ el.style.height="44px"; el.style.height=Math.min(el.scrollHeight,180)+"px"; }
 $("#send").onclick=send;
 $("#stop").onclick=()=>{ if(controller) controller.abort(); };
 $("#newchat").onclick=()=>{ sid=crypto.randomUUID(); turns.innerHTML=""; $("#q").focus(); };
 $("#sayhi").onclick=()=>{ if($("#send").disabled) return; stick=true; ask("Hi"); };  // warm the model without typing
 $("#q").addEventListener("keydown",e=>{
-  if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }
+  if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); return; }
+  const el=e.target, atStart=el.selectionStart===0 && el.selectionEnd===0,
+        atEnd=el.selectionStart===el.value.length && el.selectionEnd===el.value.length;
+  // Up recalls older questions — only when caret is at the very start, so
+  // multi-line editing (moving up within text) still works normally.
+  if(e.key==="ArrowUp" && atStart && history.length){
+    e.preventDefault();
+    if(hIdx===history.length) draft=el.value;   // stash what you were typing
+    hIdx=Math.max(0,hIdx-1);
+    el.value=history[hIdx]; autosize(el); el.setSelectionRange(0,0);
+  } else if(e.key==="ArrowDown" && atEnd && hIdx<history.length){
+    e.preventDefault();
+    hIdx++;
+    el.value=hIdx===history.length ? draft : history[hIdx];
+    autosize(el); const n=el.value.length; el.setSelectionRange(n,n);
+  }
 });
 $("#q").addEventListener("input",e=>{ e.target.style.height="44px";
   e.target.style.height=Math.min(e.target.scrollHeight,180)+"px"; });
