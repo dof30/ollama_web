@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Global launcher for the local web-research agent.
+# Pins the miniforge python that has the deps (ddgs, requests, bs4, lxml),
+# so `research` works from any directory even if conda `base` isn't active.
+exec /home/kong/miniforge3/bin/python3 /home/kong/Local_LLM_web/agent.py "$@"

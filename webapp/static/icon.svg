@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- app icon: a globe (live web) under a magnifier (research), local-green -->
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="#2f6f4f"/>
+  <g transform="translate(58 56)">
+    <circle r="30" fill="#eaf3ee"/>
+    <g stroke="#2f6f4f" stroke-width="4" fill="none">
+      <circle r="30"/>
+      <ellipse rx="13" ry="30"/>
+      <path d="M-30 -10 H30 M-30 10 H30"/>
+    </g>
+  </g>
+  <g stroke="#ffffff" stroke-width="10" stroke-linecap="round">
+    <circle cx="58" cy="56" r="36" fill="none"/>
+    <path d="M85 84 L106 106"/>
+  </g>
+</svg>

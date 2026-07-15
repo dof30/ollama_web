@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# research-web — one-shot launcher for the local research web UI.
+#
+#   research-web            start the server if needed, then open the browser
+#   research-web --stop     stop the background server
+#   research-web --status   show whether it's running and where
+#
+# Safe to run repeatedly: if a server is already up it just opens the browser.
+# The server itself may hop to 8766+ when 8765 is busy, so we probe the range.
+
+PY=/home/kong/miniforge3/bin/python3
+SERVER=/home/kong/Local_LLM_web/webapp/server.py
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/research-web.log"
+mkdir -p "$(dirname "$LOG")"
+
+find_running() {  # echoes the port of an already-running instance, if any
+  for p in $(seq 8765 8774); do
+    if curl -sf --max-time 1 "http://127.0.0.1:$p/api/models" 2>/dev/null \
+        | grep -q '"app": "local-research"'; then
+      echo "$p"; return 0
+    fi
+  done
+  return 1
+}
+
+case "$1" in
+  --stop)
+    if pkill -f "$SERVER"; then echo "research web UI stopped"; else echo "not running"; fi
+    exit 0 ;;
+  --status)
+    PORT=$(find_running) && echo "running at http://127.0.0.1:$PORT" || echo "not running"
+    exit 0 ;;
+esac
+
+PORT=$(find_running)
+if [ -z "$PORT" ]; then
+  echo "starting server… (log: $LOG)"
+  nohup "$PY" "$SERVER" >>"$LOG" 2>&1 &
+  for _ in $(seq 1 40); do
+    PORT=$(find_running) && break
+    sleep 0.25
+  done
+fi
+
+if [ -z "$PORT" ]; then
+  echo "server did not come up — last log lines:"
+  tail -5 "$LOG"
+  exit 1
+fi
+
+URL="http://127.0.0.1:$PORT"
+echo "research web UI → $URL"
+xdg-open "$URL" >/dev/null 2>&1 || echo "(couldn't auto-open a browser — open $URL yourself)"

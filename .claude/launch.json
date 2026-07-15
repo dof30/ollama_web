@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "research-web",
+      "runtimeExecutable": "/home/kong/miniforge3/bin/python3",
+      "runtimeArgs": ["/home/kong/Local_LLM_web/webapp/server.py"],
+      "port": 8765
+    }
+  ]
+}
