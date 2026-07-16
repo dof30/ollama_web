@@ -41,6 +41,17 @@ def list_models():
         return []
 
 
+def unload_model(name):
+    """Drop a model from RAM now. keep_alive=0 tells Ollama to unload immediately;
+    an empty prompt means it won't reload first. (NOT -1 — that pins a model in RAM
+    forever, which once wedged one with a year-2318 expiry.)"""
+    body = json.dumps({"model": name, "keep_alive": 0}).encode("utf-8")
+    req = urllib.request.Request(OLLAMA_HOST + "/api/generate", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -75,6 +86,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
+        if self.path == "/api/unload":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                req = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._send(400, json.dumps({"error": "bad json"}))
+                return
+            name = (req.get("model") or "").strip()
+            if not name:
+                self._send(400, json.dumps({"error": "no model"}))
+                return
+            try:
+                unload_model(name)
+                self._send(200, json.dumps({"ok": True, "unloaded": name}))
+            except Exception as e:
+                self._send(502, json.dumps({"error": f"{type(e).__name__}: {e}"}))
+            return
         if self.path != "/api/ask":
             self._send(404, json.dumps({"error": "not found"}))
             return

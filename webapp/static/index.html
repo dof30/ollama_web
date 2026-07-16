@@ -66,6 +66,8 @@
   .answerbar{margin-top:6px}
   .answerbar button{padding:3px 9px;font-size:12px}
   .stream{white-space:pre-wrap}
+  .draft{margin-top:8px;opacity:.72}
+  .draft .steplabel{color:var(--warn)}
   footer{border-top:1px solid var(--line);background:var(--panel);padding:12px 0}
   .composer{display:flex;gap:8px;align-items:flex-end}
   textarea{flex:1;resize:none;min-height:44px;max-height:180px;font:inherit;color:var(--ink);
@@ -83,6 +85,7 @@
     <label><small style="color:var(--dim)">model</small></label>
     <select id="model"></select>
     <button id="sayhi" title="Warm up the selected model so it's ready — no need to type hi">Say Hi!</button>
+    <button id="deactivate" title="Unload the selected model from RAM to free memory">Deactivate</button>
     <select id="depth" title="How hard to work">
       <option value="0" selected>Auto</option>
       <option value="1">Quick (1 source)</option>
@@ -205,6 +208,21 @@ function setDone(ctx, ok=true){
   ctx.trace.open = false;
 }
 
+// An interim answer that turned out to be a lead-in to more research must NOT be
+// destroyed — the model may have written good, correct prose before deciding to
+// verify. Instead of deleting it, tuck the rendered draft into the trace so it's
+// still on the page (collapsed), and nothing the model wrote is ever lost.
+function parkDraft(ctx){
+  const live = ctx.ansLive; ctx.ansLive = null;
+  if(!live) return;
+  if(!live.innerHTML.trim()){ live.remove(); return; }   // nothing worth keeping
+  const d = document.createElement("div"); d.className = "step draft";
+  d.innerHTML = '<span class="steplabel">earlier draft · revised after more research</span>';
+  live.classList.add("answer");        // keep the markdown styling once moved out of .ans
+  d.appendChild(live);                 // relocate the existing node (detaches it from .ans)
+  (ctx.stepEl || ctx.body).appendChild(d);
+}
+
 // ---- consume the SSE stream ----
 async function ask(question){
   const model = $("#model").value, depth = $("#depth").value;
@@ -248,13 +266,14 @@ function handle(ctx, ev){
   clearLoad(ctx);
   switch(ev.type){
     case "step":{
+      // A prior step may have begun an answer that turned out to be more research.
+      // Park that draft in the trace (don't delete it) before opening the new step.
+      parkDraft(ctx);
       const s=document.createElement("div"); s.className="step";
       s.innerHTML=`<span class="steplabel">step ${ev.n}</span>`;
       const th=document.createElement("div"); th.className="think"; s.appendChild(th);
       ctx.body.appendChild(s); ctx.stepEl=s; ctx.thinkEl=th; ctx.stepBuf="";
-      // reset answer state; if a prior step began an answer that turned out to be
-      // more research, undo it.
-      ctx.answering=false; if(ctx.ansLive){ ctx.ansLive.remove(); ctx.ansLive=null; }
+      ctx.answering=false;
       setStatus(ctx, "thinking…");
       // On the first step, the gap before any token is usually the model loading
       // into RAM (~30s cold). Say so in the status if nothing arrives shortly.
@@ -285,9 +304,10 @@ function handle(ctx, ev){
       break;
     }
     case "tool_call":{
-      // that streamed content was a tool call, not the answer — discard it, and
-      // if we had prematurely started showing an answer, undo that too.
-      ctx.stepBuf=""; if(ctx.ansLive){ ctx.ansLive.remove(); ctx.ansLive=null; } ctx.answering=false;
+      // that streamed content was a lead-in to a tool call, not the final answer.
+      // Keep whatever prose already rendered (park it in the trace), then continue.
+      parkDraft(ctx);
+      ctx.stepBuf=""; ctx.answering=false;
       setStatus(ctx, (ev.tool==="web_fetch"?"reading a page":"searching")+(ev.label?" · "+ev.label:"")+"…");
       const c=document.createElement("span"); c.className="chip tool";
       c.textContent = `⚙ ${ev.tool}(${ev.label||""})`;
@@ -338,6 +358,18 @@ $("#send").onclick=send;
 $("#stop").onclick=()=>{ if(controller) controller.abort(); };
 $("#newchat").onclick=()=>{ sid=crypto.randomUUID(); turns.innerHTML=""; $("#q").focus(); };
 $("#sayhi").onclick=()=>{ if($("#send").disabled) return; stick=true; ask("Hi"); };  // warm the model without typing
+$("#deactivate").onclick=async()=>{                       // unload the model from RAM on demand
+  const m=$("#model").value;
+  if(!m || m==="(no models)") return;
+  const btn=$("#deactivate"), old=btn.textContent;
+  btn.disabled=true; btn.textContent="Unloading…";
+  try{
+    const r=await fetch("/api/unload",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify({model:m})});
+    btn.textContent = r.ok ? "Unloaded ✓" : "Failed";
+  }catch(e){ btn.textContent="Failed"; }
+  setTimeout(()=>{ btn.textContent=old; btn.disabled=false; }, 1400);
+};
 $("#q").addEventListener("keydown",e=>{
   if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); return; }
   const el=e.target, atStart=el.selectionStart===0 && el.selectionEnd===0,
