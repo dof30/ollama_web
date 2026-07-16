@@ -206,6 +206,24 @@ def ollama_chat_stream(model, messages):
 # TOOL-CALL PARSING  (robust to gemma's messy output)
 # ========================================================================
 
+def _loads_lenient(span):
+    """json.loads, with a fallback pass for the messes local models emit. Only the
+    fallback is lenient — valid JSON always parses on the first, strict try, so we
+    never risk mangling a well-formed object."""
+    try:
+        return json.loads(span)
+    except Exception:
+        pass
+    # Common breakage: over-escaped quotes in a *bare* object, e.g.
+    #   {"query": \"esp32-p4 dsi\"}   (the \" is invalid outside a JSON string)
+    # and trailing commas before a closing brace/bracket. Repair and retry once.
+    repaired = span.replace('\\"', '"')
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    try:
+        return json.loads(repaired)
+    except Exception:
+        return None
+
 def _balanced_json_objects(text):
     objs, depth, start = [], 0, None
     for i, ch in enumerate(text):
@@ -216,10 +234,9 @@ def _balanced_json_objects(text):
         elif ch == "}" and depth > 0:
             depth -= 1
             if depth == 0 and start is not None:
-                try:
-                    objs.append(json.loads(text[start:i + 1]))
-                except Exception:
-                    pass
+                obj = _loads_lenient(text[start:i + 1])
+                if obj is not None:
+                    objs.append(obj)
                 start = None
     return objs
 
