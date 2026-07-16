@@ -10,16 +10,57 @@ whole run is visible live. Runs on localhost only.
     RESEARCH_WEB_PORT=9000 python3 server.py
 """
 
+import importlib
 import json
 import os
 import sys
+import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import engine  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import agent    # noqa: E402  (engine's dependency; held here so we can hot-reload it)
+import engine   # noqa: E402
 import history  # noqa: E402  (write-only recorder; no HTTP route ever reads it)
+
+# Hot-reload the research code on edit, so a fix on disk is a fix live — matching
+# how index.html is already served fresh each request. Without this, agent.py /
+# engine.py stay cached in the process and edits silently do nothing until a manual
+# restart (which once looked like "the fix didn't work"). Reload only when a file's
+# mtime changes; a lock keeps a concurrent request from seeing a half-reloaded module.
+_reload_lock = threading.Lock()
+_mtimes = {}
+
+
+def _src_mtime(mod):
+    try:
+        return os.stat(mod.__file__).st_mtime
+    except OSError:
+        return None
+
+
+def hot_reload():
+    """Reload agent then engine (engine imports agent, so order matters) if either
+    changed. Best-effort: a reload error leaves the last-good modules running."""
+    with _reload_lock:
+        for mod in (agent, engine):          # agent first: engine re-imports it
+            m = _src_mtime(mod)
+            if m is not None and _mtimes.get(mod.__file__) != m:
+                try:
+                    importlib.reload(mod)
+                    _mtimes[mod.__file__] = m
+                except Exception as e:
+                    print(f"hot-reload of {mod.__name__} failed, keeping old: "
+                          f"{type(e).__name__}: {e}", flush=True)
+
+
+# Seed mtimes at startup so the first request is a no-op, not a needless reload.
+for _m in (agent, engine):
+    _mt = _src_mtime(_m)
+    if _mt is not None:
+        _mtimes[_m.__file__] = _mt
 
 HOST = os.environ.get("RESEARCH_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("RESEARCH_WEB_PORT", "8765"))
@@ -86,6 +127,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
+        hot_reload()  # pick up any edits to agent.py / engine.py before serving
         if self.path == "/api/unload":
             length = int(self.headers.get("Content-Length", 0))
             try:
