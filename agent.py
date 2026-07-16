@@ -265,25 +265,24 @@ def format_observation(tool, result):
 # AGENT LOOP
 # ========================================================================
 
-def _stream_turn(model, messages, header):
-    """Stream one model completion, echo it dim, append to history, and return
-    (content, thinking). Reasoning models put their answer or tool call in either
-    channel, so we hand back both and let the caller decide which to act on."""
-    sys.stdout.write(c(f"\n  ┄ {header} ┄\n", C.dim))
-    sys.stdout.flush()
+def _stream_turn(model, messages):
+    """Stream one model completion, yielding {"type":"answer_chunk"|"thinking"} as
+    tokens arrive, then a final {"_turn": (content, thinking)} sentinel. Reasoning
+    models split output across a content and a thinking channel and may hide the
+    answer or the tool call in either, so we surface both and let the caller decide.
+    This is the one streaming primitive behind both the CLI and the web UI."""
     content, thinking = "", ""
     for kind, chunk in ollama_chat_stream(model, messages):
         if kind == "content":
             content += chunk
+            yield {"type": "answer_chunk", "text": chunk}
         else:
             thinking += chunk
-        sys.stdout.write(c(chunk, C.dim))
-        sys.stdout.flush()
-    sys.stdout.write("\n")
+            yield {"type": "thinking", "text": chunk}
     # Keep the actual answer/tool-call JSON in history; fall back to the reasoning
     # channel when the model left content empty so the tool call isn't lost.
     messages.append({"role": "assistant", "content": content or thinking})
-    return content, thinking
+    yield {"_turn": (content, thinking)}
 
 SYNTH_FROM_EVIDENCE = (
     "Enough research — do NOT call any more tools. Using ALL the evidence you "
@@ -295,106 +294,179 @@ SYNTH_FROM_KNOWLEDGE = (
     "you need to search. Answer the question directly from your own knowledge, as "
     "prose. If you are not fully certain, say so in one short line at the end.")
 
-def forced_synthesis(model, messages, instruction=SYNTH_FROM_EVIDENCE):
-    """Guarantee a written answer: tell the model to stop researching and report."""
+def _synthesis(model, messages, instruction=SYNTH_FROM_EVIDENCE):
+    """Force a written answer (no more tools): stream it as answer chunks, then end
+    with a `final` event carrying the whole text."""
     messages.append({"role": "user", "content": instruction})
-    content, thinking = _stream_turn(model, messages, "writing final answer")
-    return content or thinking
+    content = thinking = ""
+    for ev in _stream_turn(model, messages):
+        if "_turn" in ev:
+            content, thinking = ev["_turn"]
+        else:
+            yield ev
+    yield {"type": "final", "text": (content or thinking).strip()}
 
-def run_agent(model, messages, min_sources=MIN_SOURCES):
-    """Runs the tool loop until the model produces a final (JSON-free) answer.
-    A depth gate blocks premature answers until it has READ enough distinct
-    pages. `messages` is mutated in place so REPL follow-ups keep context."""
+
+def research_events(model, messages, min_sources=MIN_SOURCES):
+    """The research loop as a STREAM OF EVENTS — the single source of truth behind
+    both the terminal renderer (run_agent) and the web UI (webapp/engine.py). It
+    drives the ReAct tool loop, mutating `messages` in place so follow-ups keep
+    context. A depth gate (min_sources > 0) blocks a premature answer until enough
+    distinct pages are read. Event types: step / thinking / answer_chunk /
+    tool_call / observation / source / notice / final / error / done."""
     read_domains = set()    # distinct sites actually fetched — this is our "depth"
     unread_urls = []        # urls seen in search results but not yet fetched
     nudges = 0
     stalls = 0              # turns that returned only reasoning — no answer, no call
-    for step in range(1, MAX_STEPS + 1):
-        gate = f", read {len(read_domains)}/{min_sources}" if min_sources > 0 else ""
-        content, thinking = _stream_turn(
-            model, messages, f"thinking (step {step}/{MAX_STEPS}{gate})")
+    try:
+        for step in range(1, MAX_STEPS + 1):
+            yield {"type": "step", "n": step}
 
-        call = extract_tool_call(content)
-        if not call and not content.strip():
-            # Content came back empty — a reasoning model (gpt-oss) may have hidden
-            # the tool call, or its whole answer, in the thinking channel instead.
-            call = extract_tool_call(thinking)
-        if not call:
-            # Model wants to finalize. Enforce depth unless it has read enough.
-            if len(read_domains) < min_sources and nudges < MAX_NUDGES:
-                nudges += 1
-                print(c(f"  ⤴ too shallow ({len(read_domains)}/{min_sources} sources read) "
-                        f"— sending it back to read more", C.yellow))
-                picks = [u for u in unread_urls if urllib.parse.urlparse(u).netloc not in read_domains][:5]
-                url_hint = ("\nFetch one of these pages you already found:\n" +
+            content = thinking = ""
+            for ev in _stream_turn(model, messages):
+                if "_turn" in ev:
+                    content, thinking = ev["_turn"]
+                else:
+                    yield ev
+
+            call = extract_tool_call(content)
+            if not call and not content.strip():
+                # Content came back empty — a reasoning model (gpt-oss) may have hidden
+                # the tool call, or its whole answer, in the thinking channel instead.
+                call = extract_tool_call(thinking)
+
+            if not call:
+                # Model wants to finalize. Enforce depth unless it has read enough.
+                if len(read_domains) < min_sources and nudges < MAX_NUDGES:
+                    nudges += 1
+                    yield {"type": "notice",
+                           "text": f"too shallow ({len(read_domains)}/{min_sources} read) — reading more"}
+                    picks = [u for u in unread_urls
+                             if urllib.parse.urlparse(u).netloc not in read_domains][:5]
+                    hint = ("\nFetch one of these pages you already found:\n" +
                             "\n".join(f"- {u}" for u in picks)) if picks else ""
-                messages.append({
-                    "role": "user",
-                    "content": (
+                    messages.append({"role": "user", "content": (
                         f"STOP — do not finalize yet, and do NOT run another web_search. You have "
                         f"READ only {len(read_domains)} independent source(s), which is too shallow. "
                         f"web_fetch a page from a website you have NOT read yet, then continue."
-                        f"{url_hint}\nRespond now with a web_fetch tool call (JSON only)."
-                    ),
-                })
-                continue
-            if content.strip():
-                return content  # real final answer, already streamed above
-            # Empty content, no tool call anywhere: the model returned only internal
-            # reasoning. It usually means it intends to act but hasn't emitted the
-            # JSON yet — nudge it to actually produce the call (or the answer) rather
-            # than forcing synthesis, which would make it answer from stale memory
-            # without ever searching. Bounded so a stuck model still terminates.
-            if stalls < MAX_NUDGES:
-                stalls += 1
-                print(c("  ⤴ described a tool call but didn't emit it — nudging", C.yellow))
-                messages.append({
-                    "role": "user",
-                    "content": (
+                        f"{hint}\nRespond now with a web_fetch tool call (JSON only).")})
+                    continue
+                if content.strip():
+                    yield {"type": "final", "text": content.strip()}
+                    yield {"type": "done"}
+                    return
+                # Empty content, no tool call anywhere: only internal reasoning came
+                # back. Nudge it to actually emit the call (or the answer) rather than
+                # forcing synthesis, which would answer from stale memory without ever
+                # searching. Bounded so a stuck model still terminates.
+                if stalls < MAX_NUDGES:
+                    stalls += 1
+                    yield {"type": "notice", "text": "described a tool call but didn't emit it — nudging"}
+                    messages.append({"role": "user", "content": (
                         "You described a tool call in words but did not emit it, so nothing ran. "
                         "Reply with ONLY the JSON object and nothing else, e.g.:\n"
                         '{"tool": "web_search", "args": {"query": "<what to look up>"}}\n'
                         "Fill in the query and send just that. If you truly don't need the web, "
-                        "write the FINAL ANSWER as prose instead."
-                    ),
-                })
-                continue
-            # Nudges exhausted: if it researched, synthesize from that; else answer
-            # from its own knowledge (never surface raw "I need to search" reasoning).
-            return forced_synthesis(model, messages,
-                                    SYNTH_FROM_EVIDENCE if read_domains else SYNTH_FROM_KNOWLEDGE)
+                        "write the FINAL ANSWER as prose instead.")})
+                    continue
+                # Nudges exhausted: if it researched, synthesize from that; else answer
+                # from its own knowledge (never surface raw "I need to search" reasoning).
+                instr = SYNTH_FROM_EVIDENCE if read_domains else SYNTH_FROM_KNOWLEDGE
+                for ev in _synthesis(model, messages, instr):
+                    yield ev
+                yield {"type": "done"}
+                return
 
-        tool, args = call
-        label = args.get("query") or args.get("url") or ""
-        print(c(f"\n  ⚙ {tool}({label})", C.cyan))
-        t0 = time.time()
-        try:
-            result = TOOLS[tool](args)
-            obs = format_observation(tool, result)
-            n = len(result) if isinstance(result, list) else 1
-            print(c(f"  ✓ {n} result(s) in {time.time()-t0:.1f}s", C.green))
-            if tool == "web_fetch":  # count it as a real source read
-                dom = urllib.parse.urlparse(args.get("url", "")).netloc
-                if dom:
-                    read_domains.add(dom)
-            elif isinstance(result, list):  # remember URLs we could fetch later
-                unread_urls.extend(it["url"] for it in result if it.get("url"))
-        except Exception as e:
-            obs = f"ERROR running {tool}: {type(e).__name__}: {e}"
-            print(c(f"  ✗ {obs}", C.red))
+            # --- a tool was requested ---
+            tool, args = call
+            label = args.get("query") or args.get("url") or ""
+            yield {"type": "tool_call", "tool": tool, "label": label}
+            t0 = time.time()
+            try:
+                result = TOOLS[tool](args)
+                obs = format_observation(tool, result)
+                n = len(result) if isinstance(result, list) else 1
+                yield {"type": "observation", "tool": tool, "n": n, "ok": True,
+                       "preview": f"{n} result(s) in {time.time() - t0:.1f}s"}
+                if tool == "web_fetch":  # count it as a real source read
+                    dom = urllib.parse.urlparse(args.get("url", "")).netloc
+                    if dom:
+                        read_domains.add(dom)
+                        yield {"type": "source", "url": args.get("url", "")}
+                elif isinstance(result, list):  # remember URLs we could fetch later
+                    unread_urls.extend(it["url"] for it in result if it.get("url"))
+            except Exception as e:
+                obs = f"ERROR running {tool}: {type(e).__name__}: {e}"
+                yield {"type": "observation", "tool": tool, "n": 0, "ok": False, "preview": obs}
 
-        messages.append({
-            "role": "user",
-            "content": f"OBSERVATION from {tool}:\n{obs}\n\n"
-                       f"Continue: call another tool (JSON only) or write the FINAL ANSWER.",
-        })
+            messages.append({"role": "user", "content":
+                             f"OBSERVATION from {tool}:\n{obs}\n\n"
+                             f"Continue: call another tool (JSON only) or write the FINAL ANSWER."})
 
-        # Once we've pushed it enough, stop looping and make it write the report.
-        if nudges >= MAX_NUDGES and len(read_domains) >= 1:
-            break
+            # Once we've pushed it enough, stop looping and make it write the report.
+            if nudges >= MAX_NUDGES and len(read_domains) >= 1:
+                break
 
-    return forced_synthesis(model, messages,
-                            SYNTH_FROM_EVIDENCE if read_domains else SYNTH_FROM_KNOWLEDGE)
+        instr = SYNTH_FROM_EVIDENCE if read_domains else SYNTH_FROM_KNOWLEDGE
+        for ev in _synthesis(model, messages, instr):
+            yield ev
+        yield {"type": "done"}
+    except Exception as e:
+        yield {"type": "error", "text": f"{type(e).__name__}: {e}"}
+        yield {"type": "done"}
+
+
+def run_agent(model, messages, min_sources=MIN_SOURCES):
+    """Render the shared research event stream to the terminal and return the final
+    answer text. The loop itself lives in research_events — this is just the CLI's
+    renderer, the terminal twin of the web UI's event handler. `messages` is mutated
+    in place so REPL follow-ups keep context."""
+    answer = ""
+    read = 0                 # distinct sources read so far (mirrors the depth gate)
+    at_line_start = True     # so section markers always break cleanly off a stream line
+
+    def newline():
+        nonlocal at_line_start
+        if not at_line_start:
+            sys.stdout.write("\n")
+            at_line_start = True
+
+    for ev in research_events(model, messages, min_sources):
+        t = ev.get("type")
+        if t == "step":
+            newline()
+            gate = f", read {read}/{min_sources}" if min_sources > 0 else ""
+            sys.stdout.write(c(f"\n  ┄ thinking (step {ev['n']}/{MAX_STEPS}{gate}) ┄\n", C.dim))
+            at_line_start = True
+        elif t in ("thinking", "answer_chunk"):
+            sys.stdout.write(c(ev["text"], C.dim))
+            at_line_start = ev["text"].endswith("\n")
+        elif t == "tool_call":
+            newline()
+            sys.stdout.write(c(f"\n  ⚙ {ev['tool']}({ev.get('label', '')})\n", C.cyan))
+            at_line_start = True
+        elif t == "observation":
+            newline()
+            ok = ev.get("ok")
+            sys.stdout.write(c(f"  {'✓' if ok else '✗'} {ev.get('preview', '')}\n",
+                               C.green if ok else C.red))
+            at_line_start = True
+        elif t == "source":
+            read += 1
+        elif t == "notice":
+            newline()
+            sys.stdout.write(c(f"  ⤴ {ev['text']}\n", C.yellow))
+            at_line_start = True
+        elif t == "final":
+            answer = ev.get("text", "")
+        elif t == "error":
+            newline()
+            sys.stdout.write(c(f"  ⚠ {ev['text']}\n", C.red))
+            answer = answer or ev["text"]
+            at_line_start = True
+        sys.stdout.flush()
+    newline()
+    return answer
 
 # ========================================================================
 # ENTRY POINTS
