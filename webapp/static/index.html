@@ -24,7 +24,7 @@
        display:flex;flex-direction:column}
   header{display:flex;gap:10px;align-items:center;padding:10px 14px;
          border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
-  header .title{font-weight:600}
+  header .title{font-weight:600;margin-right:auto}
   header .title small{color:var(--dim);font-weight:400}
   select,button{font:inherit;color:var(--ink);background:var(--panel);
                 border:1px solid var(--line);border-radius:8px;padding:6px 10px;cursor:pointer}
@@ -82,7 +82,6 @@
 <body>
   <header>
     <span class="title">local research <small>· web-capable local LLM</small></span>
-    <button id="newchat" style="margin-right:auto">New chat</button>
     <label><small style="color:var(--dim)">model</small></label>
     <select id="model"></select>
     <button id="sayhi" title="Warm up the selected model so it's ready — no need to type hi">Say Hi!</button>
@@ -92,6 +91,7 @@
       <option value="1">Quick (1 source)</option>
       <option value="5">Deep (5 sources)</option>
     </select>
+    <button id="newchat">New chat</button>
   </header>
 
   <div id="convo"><div class="wrap" id="turns"></div></div>
