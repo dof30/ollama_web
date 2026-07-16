@@ -3,9 +3,12 @@
 research — give your local Ollama models the ability to search the live web,
 read pages, and pull arXiv papers, straight from the terminal.
 
-No web UI. No API keys. Works with gemma4 (or any Ollama model) because it
-drives the model with a plain-text ReAct loop instead of Ollama's native
-tool-calling API (which gemma's chat template does not render reliably).
+No web UI. No API keys. Models that support Ollama's native tool-calling API
+(gpt-oss, qwen3, ...) are driven through it — the model emits tool calls in the
+channel it was trained on and they arrive as parsed objects, not as JSON we
+scrape out of prose. Models without tool support (gemma4, whose chat template
+does not render tools reliably) automatically fall back to the original
+plain-text ReAct loop.
 
 Usage:
     python3 agent.py "your question"            # one-shot research report
@@ -129,6 +132,54 @@ TOOLS = {
     "arxiv_search": lambda a: arxiv_search(a.get("query", ""), a.get("max_results", 5)),
 }
 
+# The same three tools as JSON-schema specs for Ollama's NATIVE tool-calling API.
+# With these passed to /api/chat, a tool-trained model (gpt-oss, qwen3) emits calls
+# through the channel it was trained on and Ollama hands them to us already parsed —
+# no scraping JSON out of prose, so no escaping bugs and no "described but didn't
+# emit" stalls. Models without tool support fall back to the in-band protocol.
+TOOL_SPECS = [
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the live web (DuckDuckGo). Returns titles, URLs and snippets.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "the search query"},
+            "max_results": {"type": "integer", "description": "how many results, 1-10 (default 5)"},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "web_fetch",
+        "description": "Download one web page and return its readable text.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "full http(s) URL of the page to read"},
+        }, "required": ["url"]},
+    }},
+    {"type": "function", "function": {
+        "name": "arxiv_search",
+        "description": "Search arXiv for papers. Returns titles, URLs, authors and abstracts.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "the search query"},
+            "max_results": {"type": "integer", "description": "how many results, 1-10 (default 5)"},
+        }, "required": ["query"]},
+    }},
+]
+
+_TOOLS_CAP = {}  # model name -> bool, probed once per process
+
+def model_supports_tools(model):
+    """True if Ollama reports native tool-calling capability for this model.
+    Conservative: any failure (old Ollama without `capabilities`, unknown model,
+    Ollama down) means False and we use the in-band JSON protocol instead."""
+    if model not in _TOOLS_CAP:
+        try:
+            body = json.dumps({"model": model, "name": model}).encode()  # old Ollama wants "name"
+            req = urllib.request.Request(OLLAMA_HOST + "/api/show", data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                _TOOLS_CAP[model] = "tools" in (json.load(r).get("capabilities") or [])
+        except Exception:
+            _TOOLS_CAP[model] = False
+    return _TOOLS_CAP[model]
+
 # ========================================================================
 # SYSTEM PROMPT
 # ========================================================================
@@ -169,19 +220,54 @@ RULES:
   answer with reasonable confidence, stop and answer.
 """
 
+# For models driven through Ollama's native tool-calling API. The tool definitions
+# travel in the API request, so this prompt carries none of the in-band JSON
+# protocol — asking for JSON-in-prose while also passing native tools would pull
+# the model in two directions at once.
+SYSTEM_NATIVE = """You are a research assistant running locally on the user's machine.
+You can reach the LIVE internet through the tools provided (web_search, web_fetch,
+arxiv_search). Your training data is frozen and may be outdated, so for anything
+current, factual, technical, or that you are not fully certain about, you MUST
+use the tools rather than guess.
+
+HOW TO ACT — match your effort to the question:
+1. Casual, conversational, or simple questions you already know cold: just
+   answer directly. No tools, no multi-step analysis, no ceremony.
+2. Questions needing current or verifiable facts: call the tools. Deciding to
+   search is not searching — actually invoke the tool, don't narrate the plan.
+3. Read each tool result before deciding your next step.
+4. For a quick lookup, one good source is enough — web_fetch it rather than
+   trusting a search snippet, then answer.
+5. Save the thorough treatment (several searches from different angles,
+   multiple independent sources, cross-checking) for when the user explicitly
+   asks for deep research or the stakes clearly demand it.
+6. Write the FINAL ANSWER as normal prose. If you used web sources, cite them
+   inline as [1], [2], ... and list the full URLs under a "Sources:" heading;
+   note any disagreements between sources.
+
+RULES:
+- Never invent URLs, facts, numbers, or citations. Only cite pages you actually
+  fetched or that appeared in search results.
+- Prefer primary sources (papers, official docs, repos) over blog summaries.
+- Use as many tool calls as the question deserves and no more. When you can
+  answer with reasonable confidence, stop and answer.
+"""
+
 # ========================================================================
 # OLLAMA (streaming, via stdlib — no extra dependency)
 # ========================================================================
 
-def ollama_chat_stream(model, messages):
-    body = json.dumps({
+def ollama_chat_stream(model, messages, tools=None):
+    payload = {
         "model": model,
         "messages": messages,
         "stream": True,
         "options": {"temperature": 0.4, "num_ctx": NUM_CTX},
-    }).encode()
+    }
+    if tools:
+        payload["tools"] = tools
     req = urllib.request.Request(
-        OLLAMA_HOST + "/api/chat", data=body,
+        OLLAMA_HOST + "/api/chat", data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req) as resp:
@@ -199,6 +285,11 @@ def ollama_chat_stream(model, messages):
                 yield ("content", msg["content"])
             if msg.get("thinking"):
                 yield ("thinking", msg["thinking"])
+            # Native tool calls arrive already parsed — arguments is a dict, not
+            # text to scrape. This only happens when `tools` was passed.
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                yield ("tool_call", (fn.get("name", ""), fn.get("arguments") or {}))
             if obj.get("done"):
                 break
 
@@ -265,24 +356,35 @@ def format_observation(tool, result):
 # AGENT LOOP
 # ========================================================================
 
-def _stream_turn(model, messages):
+def _stream_turn(model, messages, tools=None):
     """Stream one model completion, yielding {"type":"answer_chunk"|"thinking"} as
-    tokens arrive, then a final {"_turn": (content, thinking)} sentinel. Reasoning
-    models split output across a content and a thinking channel and may hide the
-    answer or the tool call in either, so we surface both and let the caller decide.
-    This is the one streaming primitive behind both the CLI and the web UI."""
-    content, thinking = "", ""
-    for kind, chunk in ollama_chat_stream(model, messages):
+    tokens arrive, then a final {"_turn": (content, thinking, native_calls)}
+    sentinel, where native_calls is a list of (tool, args) that arrived through
+    Ollama's tool-call channel (empty unless `tools` was passed and used).
+    Reasoning models split output across a content and a thinking channel and may
+    hide the answer or the tool call in either, so we surface both and let the
+    caller decide. This is the one streaming primitive behind both the CLI and web."""
+    content, thinking, native_calls = "", "", []
+    for kind, chunk in ollama_chat_stream(model, messages, tools):
         if kind == "content":
             content += chunk
             yield {"type": "answer_chunk", "text": chunk}
-        else:
+        elif kind == "thinking":
             thinking += chunk
             yield {"type": "thinking", "text": chunk}
-    # Keep the actual answer/tool-call JSON in history; fall back to the reasoning
-    # channel when the model left content empty so the tool call isn't lost.
-    messages.append({"role": "assistant", "content": content or thinking})
-    yield {"_turn": (content, thinking)}
+        else:
+            native_calls.append(chunk)  # already-parsed (tool, args)
+    if native_calls:
+        # Echo the turn back in native form so the model's chat template renders
+        # the calls the way it was trained to see them.
+        messages.append({"role": "assistant", "content": content,
+                         "tool_calls": [{"function": {"name": n, "arguments": a}}
+                                        for n, a in native_calls]})
+    else:
+        # Keep the answer / in-band tool-call JSON in history; fall back to the
+        # reasoning channel when content is empty so a hidden call isn't lost.
+        messages.append({"role": "assistant", "content": content or thinking})
+    yield {"_turn": (content, thinking, native_calls)}
 
 SYNTH_FROM_EVIDENCE = (
     "Enough research — do NOT call any more tools. Using ALL the evidence you "
@@ -295,13 +397,14 @@ SYNTH_FROM_KNOWLEDGE = (
     "prose. If you are not fully certain, say so in one short line at the end.")
 
 def _synthesis(model, messages, instruction=SYNTH_FROM_EVIDENCE):
-    """Force a written answer (no more tools): stream it as answer chunks, then end
-    with a `final` event carrying the whole text."""
+    """Force a written answer: stream it as answer chunks, then end with a `final`
+    event carrying the whole text. No `tools` are passed here, so in native mode
+    the model cannot call anything even if it wants to — prose is the only exit."""
     messages.append({"role": "user", "content": instruction})
     content = thinking = ""
     for ev in _stream_turn(model, messages):
         if "_turn" in ev:
-            content, thinking = ev["_turn"]
+            content, thinking, _ = ev["_turn"]
         else:
             yield ev
     yield {"type": "final", "text": (content or thinking).strip()}
@@ -313,7 +416,19 @@ def research_events(model, messages, min_sources=MIN_SOURCES):
     drives the ReAct tool loop, mutating `messages` in place so follow-ups keep
     context. A depth gate (min_sources > 0) blocks a premature answer until enough
     distinct pages are read. Event types: step / thinking / answer_chunk /
-    tool_call / observation / source / notice / final / error / done."""
+    tool_call / observation / source / notice / final / error / done.
+
+    Tool protocol is chosen per model: native Ollama tool calling when the model
+    supports it (calls arrive parsed, in the channel the model was trained on),
+    otherwise the original in-band JSON protocol. The in-band parser also stays on
+    as a safety net in native mode, catching a model that writes JSON as text."""
+    native = model_supports_tools(model)
+    tools = TOOL_SPECS if native else None
+    # The two protocols need different instructions, and the user can switch models
+    # mid-session, so refresh the system prompt on every call. messages[0] is always
+    # the system message (compact_turn preserves it).
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] = SYSTEM_NATIVE if native else SYSTEM
     read_domains = set()    # distinct sites actually fetched — this is our "depth"
     unread_urls = []        # urls seen in search results but not yet fetched
     nudges = 0
@@ -323,19 +438,26 @@ def research_events(model, messages, min_sources=MIN_SOURCES):
             yield {"type": "step", "n": step}
 
             content = thinking = ""
-            for ev in _stream_turn(model, messages):
+            calls = []
+            for ev in _stream_turn(model, messages, tools):
                 if "_turn" in ev:
-                    content, thinking = ev["_turn"]
+                    content, thinking, calls = ev["_turn"]
                 else:
                     yield ev
 
-            call = extract_tool_call(content)
-            if not call and not content.strip():
-                # Content came back empty — a reasoning model (gpt-oss) may have hidden
-                # the tool call, or its whole answer, in the thinking channel instead.
-                call = extract_tool_call(thinking)
+            came_natively = bool(calls)
+            if not calls:
+                # In-band protocol — or a native-capable model that wrote the JSON
+                # into its text anyway. The lenient parser catches both.
+                call = extract_tool_call(content)
+                if not call and not content.strip():
+                    # Content came back empty — a reasoning model (gpt-oss) may have
+                    # hidden the call, or its whole answer, in the thinking channel.
+                    call = extract_tool_call(thinking)
+                if call:
+                    calls = [call]
 
-            if not call:
+            if not calls:
                 # Model wants to finalize. Enforce depth unless it has read enough.
                 if len(read_domains) < min_sources and nudges < MAX_NUDGES:
                     nudges += 1
@@ -349,7 +471,8 @@ def research_events(model, messages, min_sources=MIN_SOURCES):
                         f"STOP — do not finalize yet, and do NOT run another web_search. You have "
                         f"READ only {len(read_domains)} independent source(s), which is too shallow. "
                         f"web_fetch a page from a website you have NOT read yet, then continue."
-                        f"{hint}\nRespond now with a web_fetch tool call (JSON only).")})
+                        f"{hint}\n" + ("Call the web_fetch tool now." if native else
+                                       "Respond now with a web_fetch tool call (JSON only)."))})
                     continue
                 if content.strip():
                     yield {"type": "final", "text": content.strip()}
@@ -363,6 +486,9 @@ def research_events(model, messages, min_sources=MIN_SOURCES):
                     stalls += 1
                     yield {"type": "notice", "text": "described a tool call but didn't emit it — nudging"}
                     messages.append({"role": "user", "content": (
+                        "Nothing ran — you described the action but did not call a tool. "
+                        "Actually invoke web_search, web_fetch or arxiv_search now, or write "
+                        "the FINAL ANSWER as prose." if native else
                         "You described a tool call in words but did not emit it, so nothing ran. "
                         "Reply with ONLY the JSON object and nothing else, e.g.:\n"
                         '{"tool": "web_search", "args": {"query": "<what to look up>"}}\n'
@@ -377,31 +503,38 @@ def research_events(model, messages, min_sources=MIN_SOURCES):
                 yield {"type": "done"}
                 return
 
-            # --- a tool was requested ---
-            tool, args = call
-            label = args.get("query") or args.get("url") or ""
-            yield {"type": "tool_call", "tool": tool, "label": label}
-            t0 = time.time()
-            try:
-                result = TOOLS[tool](args)
-                obs = format_observation(tool, result)
-                n = len(result) if isinstance(result, list) else 1
-                yield {"type": "observation", "tool": tool, "n": n, "ok": True,
-                       "preview": f"{n} result(s) in {time.time() - t0:.1f}s"}
-                if tool == "web_fetch":  # count it as a real source read
-                    dom = urllib.parse.urlparse(args.get("url", "")).netloc
-                    if dom:
-                        read_domains.add(dom)
-                        yield {"type": "source", "url": args.get("url", "")}
-                elif isinstance(result, list):  # remember URLs we could fetch later
-                    unread_urls.extend(it["url"] for it in result if it.get("url"))
-            except Exception as e:
-                obs = f"ERROR running {tool}: {type(e).__name__}: {e}"
-                yield {"type": "observation", "tool": tool, "n": 0, "ok": False, "preview": obs}
+            # --- tools were requested (a native model may batch several per turn) ---
+            for tool, args in calls:
+                label = args.get("query") or args.get("url") or ""
+                yield {"type": "tool_call", "tool": tool, "label": label}
+                t0 = time.time()
+                try:
+                    result = TOOLS[tool](args)   # unknown tool name -> KeyError -> error obs
+                    obs = format_observation(tool, result)
+                    n = len(result) if isinstance(result, list) else 1
+                    yield {"type": "observation", "tool": tool, "n": n, "ok": True,
+                           "preview": f"{n} result(s) in {time.time() - t0:.1f}s"}
+                    if tool == "web_fetch":  # count it as a real source read
+                        dom = urllib.parse.urlparse(args.get("url", "")).netloc
+                        if dom:
+                            read_domains.add(dom)
+                            yield {"type": "source", "url": args.get("url", "")}
+                    elif isinstance(result, list):  # remember URLs we could fetch later
+                        unread_urls.extend(it["url"] for it in result if it.get("url"))
+                except Exception as e:
+                    obs = f"ERROR running {tool}: {type(e).__name__}: {e}"
+                    yield {"type": "observation", "tool": tool, "n": 0, "ok": False, "preview": obs}
 
-            messages.append({"role": "user", "content":
-                             f"OBSERVATION from {tool}:\n{obs}\n\n"
-                             f"Continue: call another tool (JSON only) or write the FINAL ANSWER."})
+                # Feed the result back in whichever protocol the call arrived by. A
+                # natively-called turn gets a real `tool` message (the template
+                # renders it the way the model was trained on, and no "Continue:"
+                # coaching is needed); an in-band call gets the OBSERVATION message.
+                if came_natively:
+                    messages.append({"role": "tool", "tool_name": tool, "content": obs})
+                else:
+                    messages.append({"role": "user", "content":
+                                     f"OBSERVATION from {tool}:\n{obs}\n\n"
+                                     f"Continue: call another tool (JSON only) or write the FINAL ANSWER."})
 
             # Once we've pushed it enough, stop looping and make it write the report.
             if nudges >= MAX_NUDGES and len(read_domains) >= 1:
