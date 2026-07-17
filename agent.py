@@ -43,6 +43,26 @@ MIN_SOURCES   = int(os.environ.get("RESEARCH_MIN_SOURCES", "0"))  # 0 = no gate,
 MAX_NUDGES    = int(os.environ.get("RESEARCH_MAX_NUDGES", "4"))   # times we push it to go deeper
 UA = "Mozilla/5.0 (X11; Linux x86_64) research-agent/1.0"
 
+# ---------- how long Ollama keeps a model resident after a turn (keep_alive) ----------
+# The global floor for EVERY model lives on the Ollama server, not here — set
+# OLLAMA_KEEP_ALIVE (e.g. 5m via a systemd drop-in). Model lifecycle is an ops
+# decision. The app carries only the ONE exception a single global value can't
+# express: the workhorse we reach for constantly is worth keeping warm (a cold load
+# costs ~30s), so for sticky models we override keep_alive to 45min, refreshed by each
+# use; the web UI's Deactivate button is the manual off-switch. Non-sticky models send
+# no keep_alive field at all, so the server's global default governs them. (A finite
+# duration on purpose — never -1, which pins a model in RAM "forever" and once wedged
+# one with a year-2318 expiry.)
+KEEP_ALIVE_STICKY = os.environ.get("RESEARCH_KEEP_ALIVE_STICKY", "45m")
+# Models that stay resident. Comma-separated env override; defaults to the workhorse.
+STICKY_MODELS = set(filter(None,
+    os.environ.get("RESEARCH_STICKY_MODELS", "gpt-oss:120b-fast").split(",")))
+
+def keep_alive_for(model):
+    """The keep_alive to send for this model, or None to defer to the server's
+    global OLLAMA_KEEP_ALIVE default."""
+    return KEEP_ALIVE_STICKY if model in STICKY_MODELS else None
+
 # ---------- terminal colors ----------
 class C:
     dim    = "\033[2m"
@@ -264,6 +284,9 @@ def ollama_chat_stream(model, messages, tools=None):
         "stream": True,
         "options": {"temperature": 0.4, "num_ctx": NUM_CTX},
     }
+    ka = keep_alive_for(model)
+    if ka is not None:          # else defer to the server's global OLLAMA_KEEP_ALIVE
+        payload["keep_alive"] = ka
     if tools:
         payload["tools"] = tools
     req = urllib.request.Request(
