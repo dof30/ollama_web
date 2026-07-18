@@ -103,7 +103,7 @@
       <button id="send" class="primary">Send</button>
       <button id="stop" style="display:none">Stop</button>
     </div>
-    <div class="hint">Enter to send · Shift+Enter for a new line · everything runs locally</div>
+    <div class="hint" id="hint">Enter to send · Shift+Enter for a new line · everything runs locally</div>
   </div></footer>
 
 <script>
@@ -227,7 +227,9 @@ function parkDraft(ctx){
 async function ask(question){
   const model = $("#model").value, depth = $("#depth").value;
   const ctx = newTurn(question);
-  $("#send").disabled=true; $("#q").disabled=true; $("#stop").style.display="";
+  // Send is locked during a run, but the textarea stays enabled so the user can
+  // draft the next question while the model is still answering.
+  $("#send").disabled=true; $("#stop").style.display="";
   controller = new AbortController();
   let finalText = "";
   try{
@@ -254,7 +256,7 @@ async function ask(question){
     if(e.name!=="AbortError"){ ctx.stream.textContent = "connection error: "+e.message; }
   }finally{
     clearLoad(ctx);
-    $("#send").disabled=false; $("#q").disabled=false; $("#stop").style.display="none";
+    $("#send").disabled=false; $("#stop").style.display="none";
     controller=null; $("#q").focus();
   }
 }
@@ -345,9 +347,17 @@ function handle(ctx, ev){
 }
 
 // ---- wiring ----
+const hintEl=$("#hint"), hintDefault=hintEl.textContent; let hintTimer=null;
+function flashHint(msg){
+  hintEl.textContent=msg;
+  clearTimeout(hintTimer); hintTimer=setTimeout(()=>hintEl.textContent=hintDefault, 2000);
+}
 // Shell-style command history: Up/Down cycle through prior questions.
 const history=[]; let hIdx=0, draft="";
 function send(){
+  // While an answer is streaming, typing is free but sending is locked: wait for
+  // it to finish or press Stop. The drafted text stays in the box either way.
+  if(controller){ flashHint("⏳ model is still answering — wait or press Stop, your draft is kept"); return; }
   const q=$("#q").value.trim(); if(!q) return;
   if(history[history.length-1]!==q) history.push(q);  // no consecutive dupes
   hIdx=history.length; draft="";
