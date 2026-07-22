@@ -400,6 +400,13 @@ $("#q").addEventListener("keydown",e=>{
 });
 $("#q").addEventListener("input",e=>{ e.target.style.height="44px";
   e.target.style.height=Math.min(e.target.scrollHeight,180)+"px"; });
+document.addEventListener("keydown", e => {
+  if (e.key !== "/" || e.ctrlKey || e.altKey || e.metaKey) return;
+  const t = e.target;
+  if (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable) return;
+  e.preventDefault();
+  $("#q").focus();
+});
 loadModels(); $("#q").focus();
 </script>
 </body>
