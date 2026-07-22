@@ -41,7 +41,11 @@ MAX_STEPS     = int(os.environ.get("RESEARCH_MAX_STEPS", "12"))
 FETCH_CHARS   = int(os.environ.get("RESEARCH_FETCH_CHARS", "6000"))
 MIN_SOURCES   = int(os.environ.get("RESEARCH_MIN_SOURCES", "0"))  # 0 = no gate, model decides; --deep/--depth to force
 MAX_NUDGES    = int(os.environ.get("RESEARCH_MAX_NUDGES", "4"))   # times we push it to go deeper
-UA = "Mozilla/5.0 (X11; Linux x86_64) research-agent/1.0"
+# A stock browser UA, deliberately: a custom "research-agent" token would label
+# every fetch as a bot to sites and network observers — worse for privacy AND
+# more likely to be blocked. Blend in with the browser traffic this machine
+# already produces.
+UA = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
 
 # ---------- how long Ollama keeps a model resident after a turn (keep_alive) ----------
 # The global floor for EVERY model lives on the Ollama server, not here — set
@@ -126,9 +130,11 @@ def arxiv_search(query, max_results=5):
         "max_results": max_results,
         "sortBy": "relevance",
     })
-    url = f"http://export.arxiv.org/api/query?{q}"
+    url = f"https://export.arxiv.org/api/query?{q}"
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=25) as r:
+    # 60s, not 25: arXiv's API on a slow day takes 30s+ for multi-word relevance
+    # queries (measured), and a timeout here costs the model its paper search.
+    with urllib.request.urlopen(req, timeout=60) as r:
         raw = r.read()
     ns = {"a": "http://www.w3.org/2005/Atom"}
     root = ET.fromstring(raw)
@@ -293,7 +299,10 @@ def ollama_chat_stream(model, messages, tools=None):
         OLLAMA_HOST + "/api/chat", data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req) as resp:
+    # timeout is per socket read, not total generation time — a long answer keeps
+    # streaming fine; only a wedged Ollama (no bytes at all for 5min) trips it.
+    # Without this, a hung Ollama leaves the server thread blocked forever.
+    with urllib.request.urlopen(req, timeout=300) as resp:
         for line in resp:
             line = line.strip()
             if not line:
@@ -433,13 +442,19 @@ def _synthesis(model, messages, instruction=SYNTH_FROM_EVIDENCE):
     yield {"type": "final", "text": (content or thinking).strip()}
 
 
-def research_events(model, messages, min_sources=MIN_SOURCES):
+def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=None):
     """The research loop as a STREAM OF EVENTS — the single source of truth behind
     both the terminal renderer (run_agent) and the web UI (webapp/engine.py). It
     drives the ReAct tool loop, mutating `messages` in place so follow-ups keep
     context. A depth gate (min_sources > 0) blocks a premature answer until enough
     distinct pages are read. Event types: step / thinking / answer_chunk /
     tool_call / observation / source / notice / final / error / done.
+
+    should_wrap_up, if given, is a zero-arg predicate polled at the top of every
+    step. When it returns true (the user pressed "Answer now") the loop stops
+    researching immediately and synthesizes an answer from whatever it has so far —
+    the escape hatch for a model that keeps re-searching a question it could already
+    answer. It overrides the depth gate: an explicit "answer now" beats "too shallow".
 
     Tool protocol is chosen per model: native Ollama tool calling when the model
     supports it (calls arrive parsed, in the channel the model was trained on),
@@ -456,8 +471,16 @@ def research_events(model, messages, min_sources=MIN_SOURCES):
     unread_urls = []        # urls seen in search results but not yet fetched
     nudges = 0
     stalls = 0              # turns that returned only reasoning — no answer, no call
+    searches_in_a_row = 0   # list-tool calls since the last web_fetch (loop detector)
+
+    def wrap():
+        return bool(should_wrap_up and should_wrap_up())
+
     try:
         for step in range(1, MAX_STEPS + 1):
+            if wrap():
+                yield {"type": "notice", "text": "answer now — writing up what we have"}
+                break
             yield {"type": "step", "n": step}
 
             content = thinking = ""
@@ -482,7 +505,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES):
 
             if not calls:
                 # Model wants to finalize. Enforce depth unless it has read enough.
-                if len(read_domains) < min_sources and nudges < MAX_NUDGES:
+                if len(read_domains) < min_sources and nudges < MAX_NUDGES and not wrap():
                     nudges += 1
                     yield {"type": "notice",
                            "text": f"too shallow ({len(read_domains)}/{min_sources} read) — reading more"}
@@ -505,7 +528,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES):
                 # back. Nudge it to actually emit the call (or the answer) rather than
                 # forcing synthesis, which would answer from stale memory without ever
                 # searching. Bounded so a stuck model still terminates.
-                if stalls < MAX_NUDGES:
+                if stalls < MAX_NUDGES and not wrap():
                     stalls += 1
                     yield {"type": "notice", "text": "described a tool call but didn't emit it — nudging"}
                     messages.append({"role": "user", "content": (
@@ -527,6 +550,14 @@ def research_events(model, messages, min_sources=MIN_SOURCES):
                 return
 
             # --- tools were requested (a native model may batch several per turn) ---
+            if wrap():
+                # Drop the un-run calls and flatten the assistant turn to plain text
+                # so no chat template sees a tool call that never got a reply.
+                if messages and messages[-1].get("tool_calls"):
+                    messages[-1] = {"role": "assistant",
+                                    "content": messages[-1].get("content") or "(research cut short by user)"}
+                yield {"type": "notice", "text": "answer now — skipping further research"}
+                break
             for tool, args in calls:
                 label = args.get("query") or args.get("url") or ""
                 yield {"type": "tool_call", "tool": tool, "label": label}
@@ -538,12 +569,24 @@ def research_events(model, messages, min_sources=MIN_SOURCES):
                     yield {"type": "observation", "tool": tool, "n": n, "ok": True,
                            "preview": f"{n} result(s) in {time.time() - t0:.1f}s"}
                     if tool == "web_fetch":  # count it as a real source read
+                        searches_in_a_row = 0
                         dom = urllib.parse.urlparse(args.get("url", "")).netloc
                         if dom:
                             read_domains.add(dom)
                             yield {"type": "source", "url": args.get("url", "")}
                     elif isinstance(result, list):  # remember URLs we could fetch later
                         unread_urls.extend(it["url"] for it in result if it.get("url"))
+                        # Loop detector: a model re-searching the same question over and
+                        # over (instead of reading or answering) burns minutes for nothing.
+                        # After the 3rd search with no page read in between, say so to its
+                        # face — right inside the observation it's about to act on.
+                        searches_in_a_row += 1
+                        if searches_in_a_row >= 3:
+                            obs += (f"\n\nNOTE: that was search #{searches_in_a_row} in a row "
+                                    "without reading a single page. Searching again will NOT "
+                                    "surface anything new. Either web_fetch ONE of the URLs "
+                                    "above, or — if you already know enough — write the FINAL "
+                                    "ANSWER now.")
                 except Exception as e:
                     obs = f"ERROR running {tool}: {type(e).__name__}: {e}"
                     yield {"type": "observation", "tool": tool, "n": 0, "ok": False, "preview": obs}

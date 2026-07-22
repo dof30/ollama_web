@@ -72,6 +72,11 @@ DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "gpt-oss:120b-fast")
 # plain dict is fine; restart clears it (like the CLI's /reset).
 SESSIONS = {}
 
+# Session ids whose user pressed "Answer now": the running research loop polls this
+# set between steps and, if its sid is here, stops searching and writes the answer
+# from what it has. Set from a separate request thread; GIL makes add/discard safe.
+WRAP_UP = set()
+
 
 def list_models():
     try:
@@ -99,6 +104,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # keep the console quiet
         pass
 
+    def _local_ok(self):
+        """True only when the request is addressed to this machine. Browsers stop a
+        malicious page from READING our responses (CORS), but nothing stops one from
+        SENDING fire-and-forget requests at localhost — driving the GPU, unloading
+        models, polluting history. A Host check defeats that (and DNS rebinding,
+        where an attacker's domain resolves to 127.0.0.1 but Host betrays it)."""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+        return host in ("127.0.0.1", "localhost", "[::1]")
+
     def _send(self, code, body, ctype="application/json", extra=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
@@ -111,6 +125,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._local_ok():
+            self._send(403, json.dumps({"error": "forbidden"}))
+            return
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             with open(os.path.join(HERE, "static", "index.html"), "rb") as f:
@@ -127,6 +144,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
+        if not self._local_ok():
+            self._send(403, json.dumps({"error": "forbidden"}))
+            return
+        # Require a JSON Content-Type on every POST: our own UI always sends it, but
+        # a cross-site page can't (setting it triggers a CORS preflight, which we
+        # never approve) — so this one header cheaply blocks drive-by POSTs.
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._send(400, json.dumps({"error": "expected application/json"}))
+            return
         hot_reload()  # pick up any edits to agent.py / engine.py before serving
         if self.path == "/api/unload":
             length = int(self.headers.get("Content-Length", 0))
@@ -144,6 +171,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"ok": True, "unloaded": name}))
             except Exception as e:
                 self._send(502, json.dumps({"error": f"{type(e).__name__}: {e}"}))
+            return
+        if self.path == "/api/answer_now":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                req = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._send(400, json.dumps({"error": "bad json"}))
+                return
+            WRAP_UP.add(req.get("sid") or "default")
+            self._send(200, json.dumps({"ok": True}))
             return
         if self.path != "/api/ask":
             self._send(404, json.dumps({"error": "not found"}))
@@ -164,6 +201,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         messages = SESSIONS.setdefault(sid, engine.new_conversation())
+        WRAP_UP.discard(sid)      # a leftover flag from a past run must not cut this one short
         base_len = len(messages)  # remember where this turn starts, for compaction
         messages.append({"role": "user", "content": question})
 
@@ -177,7 +215,8 @@ class Handler(BaseHTTPRequestHandler):
         sources = []
         t0 = time.time()
         try:
-            for ev in engine.research_events(model, messages, min_sources=depth):
+            for ev in engine.research_events(model, messages, min_sources=depth,
+                                             should_wrap_up=lambda: sid in WRAP_UP):
                 if ev.get("type") == "final":
                     final_text = ev.get("text", "")
                 elif ev.get("type") == "source":
@@ -188,6 +227,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # browser navigated away / stopped the run
         finally:
+            WRAP_UP.discard(sid)  # this run is over; don't leak the flag into the next
             # Shrink this turn back to a clean Q+A so the next turn starts lean and
             # the session can't overflow the context window over a long conversation.
             engine.compact_turn(messages, base_len, question, final_text)

@@ -101,7 +101,8 @@
     <div class="composer">
       <textarea id="q" placeholder="Ask anything — parentheses, quotes, symbols all fine here."></textarea>
       <button id="send" class="primary">Send</button>
-      <button id="stop" style="display:none">Stop</button>
+      <button id="answernow" style="display:none" title="Stop researching and answer with what it already has">Answer now</button>
+      <button id="stop" style="display:none" title="Abort the run entirely">Stop</button>
     </div>
     <div class="hint" id="hint">Enter to send · Shift+Enter for a new line · everything runs locally</div>
   </div></footer>
@@ -113,7 +114,10 @@ let sid = crypto.randomUUID();
 let controller = null;
 
 // ---- minimal, dependency-free markdown -> safe HTML ----
-function esc(s){return s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+// Quotes must be escaped too: inline() builds href="..." attributes out of this
+// text, and an unescaped " in a model-written URL would break out of the
+// attribute and become live script (the URLs come from fetched web pages).
+function esc(s){return s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function inline(s){
   s = esc(s);
   s = s.replace(/`([^`]+)`/g,"<code>$1</code>");
@@ -230,6 +234,7 @@ async function ask(question){
   // Send is locked during a run, but the textarea stays enabled so the user can
   // draft the next question while the model is still answering.
   $("#send").disabled=true; $("#stop").style.display="";
+  $("#answernow").style.display=""; $("#answernow").disabled=false;
   controller = new AbortController();
   let finalText = "";
   try{
@@ -257,6 +262,7 @@ async function ask(question){
   }finally{
     clearLoad(ctx);
     $("#send").disabled=false; $("#stop").style.display="none";
+    $("#answernow").style.display="none";
     controller=null; $("#q").focus();
   }
 }
@@ -366,7 +372,21 @@ function send(){
 function autosize(el){ el.style.height="44px"; el.style.height=Math.min(el.scrollHeight,180)+"px"; }
 $("#send").onclick=send;
 $("#stop").onclick=()=>{ if(controller) controller.abort(); };
-$("#newchat").onclick=()=>{ sid=crypto.randomUUID(); turns.innerHTML=""; $("#q").focus(); };
+$("#answernow").onclick=async()=>{
+  if(!controller) return;
+  // One shot per run: the flag is set server-side, pressing again adds nothing.
+  $("#answernow").disabled=true;
+  flashHint("⏩ wrapping up — it will answer with what it has at the next step");
+  try{
+    await fetch("/api/answer_now",{method:"POST",headers:{"Content-Type":"application/json"},
+                                   body:JSON.stringify({sid})});
+  }catch(e){ $("#answernow").disabled=false; }
+};
+$("#newchat").onclick=()=>{
+  // Abort any run in flight: otherwise it keeps generating into the (now cleared)
+  // page and holds Send locked until it finishes on its own.
+  if(controller) controller.abort();
+  sid=crypto.randomUUID(); turns.innerHTML=""; $("#q").focus(); };
 $("#sayhi").onclick=()=>{ if($("#send").disabled) return; stick=true; ask("Hi"); };  // warm the model without typing
 $("#deactivate").onclick=async()=>{                       // unload the model from RAM on demand
   const m=$("#model").value;

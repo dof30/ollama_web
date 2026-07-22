@@ -70,7 +70,10 @@ def compact_turn(messages, base_len, question, answer):
 # truth shared by the terminal renderer (agent.run_agent) and this web engine. We
 # wrap it at call time (rather than aliasing the function object) so a hot-reload of
 # agent.py is picked up on the very next request without reloading this module too.
-def research_events(model, messages, min_sources=0):
+def research_events(model, messages, min_sources=0, should_wrap_up=None):
     """Yield research events for the web UI. The event contract is documented in
-    this file's header; the implementation is agent.research_events."""
-    yield from agent.research_events(model, messages, min_sources=min_sources)
+    this file's header; the implementation is agent.research_events.
+    should_wrap_up: zero-arg predicate polled each step — true means the user hit
+    "Answer now", so stop researching and write up what's already gathered."""
+    yield from agent.research_events(model, messages, min_sources=min_sources,
+                                     should_wrap_up=should_wrap_up)
