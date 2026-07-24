@@ -19,6 +19,7 @@ Usage:
 REPL commands:  /model <name>   /reset   /exit
 """
 
+import datetime
 import json
 import os
 import re
@@ -209,6 +210,66 @@ def model_supports_tools(model):
 # ========================================================================
 # SYSTEM PROMPT
 # ========================================================================
+
+def date_context():
+    """The date-awareness block stitched into the system prompt at request time.
+
+    Local models are anchored to their training window (2023–2024) and will read
+    "current", "latest", or "in recent years" as relative to THAT unless told
+    otherwise — worse, some treat a post-cutoff date as a typo and quietly ignore
+    it. So this block is rebuilt from the machine's clock on every request (see
+    system_prompt), states the date is authoritative, and pins all relative time
+    language to it."""
+    today = datetime.date.today()
+    return (
+        "TODAY'S DATE: {}.\n"
+        "This comes from the machine's clock and is authoritative. It is later "
+        "than your training data — that is not an error; your knowledge is "
+        "simply out of date, and events between your training cutoff and today "
+        "are unknown to you. Therefore:\n"
+        "- Interpret ALL relative time language (\"now\", \"current\", "
+        "\"latest\", \"recent\", \"in recent years\", \"this year\") against "
+        "today's date above, never against your training data.\n"
+        "- Never state or imply that the present year is the year your training "
+        "data ends. Do not say \"as of my knowledge\" — say what is true as of "
+        "today, searching the web if needed.\n"
+        "- For anything that may have changed since your training cutoff, "
+        "search rather than answer from memory."
+    ).format(today.strftime("%A, %B %d, %Y").replace(" 0", " "))
+
+
+def system_prompt(native):
+    """Final system prompt: fresh date block + the protocol-appropriate prompt."""
+    return date_context() + "\n\n" + (SYSTEM_NATIVE if native else SYSTEM)
+
+
+# The system-prompt date block alone loses to habit under a real task: the model
+# reads "recent years", pattern-completes a training-era year into its reasoning
+# ("as of today (July 2024)"), then searches with that stale year and never even
+# sees current pages. The last message gets the strongest attention, so a short
+# stamp on the question itself — right next to the words that trigger the habit —
+# is where the date actually lands. Deliberately minimal (one bracketed line, no
+# lecture) to keep it from leaking into answers.
+DATE_STAMP_PREFIX = "\n\n[context: today is "
+
+
+def date_stamp():
+    today = datetime.date.today()
+    return (DATE_STAMP_PREFIX + today.strftime("%A, %B %d, %Y").replace(" 0", " ")
+            + ' — "recent"/"latest"/"current" mean relative to this date, and '
+            "search queries about the present should use the current year]")
+
+
+def stamp_current_question(messages):
+    """Append today's date to the question being answered. Only the live turn
+    carries a stamp: compact_turn later rewrites the turn with the clean question,
+    so stamps never pile up in history. Idempotent in case of a double call."""
+    if not messages or messages[-1].get("role") != "user":
+        return
+    if DATE_STAMP_PREFIX in messages[-1]["content"]:
+        return
+    messages[-1]["content"] += date_stamp()
+
 
 SYSTEM = """You are a research assistant running locally on the user's machine.
 You can reach the LIVE internet through tools. Your training data is frozen and
@@ -462,11 +523,13 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
     as a safety net in native mode, catching a model that writes JSON as text."""
     native = model_supports_tools(model)
     tools = TOOL_SPECS if native else None
-    # The two protocols need different instructions, and the user can switch models
-    # mid-session, so refresh the system prompt on every call. messages[0] is always
-    # the system message (compact_turn preserves it).
+    # The two protocols need different instructions, the user can switch models
+    # mid-session, and the date block must stay current in long-lived sessions —
+    # so refresh the system prompt on every call. messages[0] is always the
+    # system message (compact_turn preserves it).
     if messages and messages[0].get("role") == "system":
-        messages[0]["content"] = SYSTEM_NATIVE if native else SYSTEM
+        messages[0]["content"] = system_prompt(native)
+    stamp_current_question(messages)  # date lands next to the question, where attention is
     read_domains = set()    # distinct sites actually fetched — this is our "depth"
     unread_urls = []        # urls seen in search results but not yet fetched
     nudges = 0
@@ -672,7 +735,9 @@ def run_agent(model, messages, min_sources=MIN_SOURCES):
 # ========================================================================
 
 def new_conversation():
-    return [{"role": "system", "content": SYSTEM}]
+    # Protocol variant and date are both refreshed per-call in research_events;
+    # this just seeds the slot so messages[0] is always the system message.
+    return [{"role": "system", "content": system_prompt(False)}]
 
 def check_model(model):
     try:
