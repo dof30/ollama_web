@@ -98,6 +98,73 @@ def unload_model(name):
         return json.load(r)
 
 
+# ---------- tab presence -> how long the workhorse stays warm ----------
+# The 45m sticky keep_alive buys instant answers, but it only earns its ~65 GB while
+# someone is actually there to ask something. So each open tab sends a heartbeat: with
+# at least one tab open the sticky 45m stands; when the last one closes we shorten the
+# timer to the server's normal 5m default. Tabs that vanish without a goodbye beacon
+# (crash, laptop sleep) age out via TAB_TTL — generous, because browsers throttle
+# timers in background tabs, and a hidden tab is still an open tab.
+TAB_TTL = 150.0     # seconds of silence before a tab counts as gone
+TAB_SWEEP = 30.0    # how often the watcher re-evaluates
+IDLE_KEEP_ALIVE = os.environ.get("RESEARCH_KEEP_ALIVE_IDLE", "5m")
+
+PRESENCE = {}                # tab id -> last heartbeat (monotonic clock)
+_presence_lock = threading.Lock()
+_tabs_warm = None            # last applied state: True=some tab, False=none, None=unknown
+
+
+def loaded_models():
+    try:
+        with urllib.request.urlopen(OLLAMA_HOST + "/api/ps", timeout=5) as r:
+            return [m["name"] for m in json.load(r).get("models", [])]
+    except Exception:
+        return []
+
+
+def set_keep_alive(name, ka):
+    """Re-arm a loaded model's unload timer. No prompt, so nothing is generated."""
+    body = json.dumps({"model": name, "keep_alive": ka}).encode("utf-8")
+    req = urllib.request.Request(OLLAMA_HOST + "/api/generate", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def apply_presence():
+    """Point sticky models' keep_alive at the current tab situation, on change only.
+
+    Only ever touches a model that is ALREADY loaded: the same empty-prompt request
+    that sets a timer would otherwise *pull the model into RAM* to do it — the exact
+    opposite of the point when nobody has a tab open."""
+    global _tabs_warm
+    now = time.monotonic()
+    with _presence_lock:
+        for tab, seen in list(PRESENCE.items()):
+            if now - seen > TAB_TTL:
+                del PRESENCE[tab]
+        warm = bool(PRESENCE)
+        if warm == _tabs_warm:
+            return
+        _tabs_warm = warm
+    ka = agent.KEEP_ALIVE_STICKY if warm else IDLE_KEEP_ALIVE
+    for name in loaded_models():
+        if name in agent.STICKY_MODELS:
+            try:
+                set_keep_alive(name, ka)
+            except Exception:
+                pass  # best effort — the server's global default still bounds it
+
+
+def _presence_watcher():
+    while True:
+        time.sleep(TAB_SWEEP)
+        try:
+            apply_presence()
+        except Exception:
+            pass
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -155,6 +222,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"error": "expected application/json"}))
             return
         hot_reload()  # pick up any edits to agent.py / engine.py before serving
+        if self.path in ("/api/ping", "/api/bye"):
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                req = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                req = {}
+            tab = str(req.get("tab") or "")[:64]
+            if tab:
+                with _presence_lock:
+                    if self.path == "/api/ping":
+                        PRESENCE[tab] = time.monotonic()
+                    else:
+                        PRESENCE.pop(tab, None)
+            apply_presence()  # react at once when the first tab opens / the last closes
+            self._send(200, json.dumps({"ok": True}))
+            return
         if self.path == "/api/unload":
             length = int(self.headers.get("Content-Length", 0))
             try:
@@ -247,6 +330,7 @@ def main():
         except OSError as e:
             last_err = e
             continue
+        threading.Thread(target=_presence_watcher, daemon=True).start()
         print(f"research web UI  ·  http://{HOST}:{port}  ·  default model {DEFAULT_MODEL}", flush=True)
         if port != PORT:
             print(f"(port {PORT} was busy — using {port} instead)", flush=True)

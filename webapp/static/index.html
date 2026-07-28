@@ -427,6 +427,24 @@ document.addEventListener("keydown", e => {
   e.preventDefault();
   $("#q").focus();
 });
+// ---- tab presence ----
+// Tell the server this tab exists, so the workhorse model only keeps its long 45m
+// keep-alive while someone is here. On the last tab closing, the server drops it to
+// the normal 5m default instead of holding ~65 GB of RAM for nothing. A hidden tab
+// still counts as open, so the heartbeat keeps running in the background.
+const tabId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
+const beat = (path, keepalive) => fetch(path, {method:"POST", keepalive,
+  headers:{"Content-Type":"application/json"}, body:JSON.stringify({tab:tabId})}).catch(()=>{});
+const ping = () => beat("/api/ping", false);
+ping(); setInterval(ping, 30000);
+// pagehide covers close/navigate/mobile better than beforeunload; sendBeacon survives
+// the teardown. If the page comes back from the bfcache, re-announce ourselves.
+addEventListener("pagehide", () => {
+  const body = new Blob([JSON.stringify({tab:tabId})], {type:"application/json"});
+  if(!navigator.sendBeacon("/api/bye", body)) beat("/api/bye", true);
+});
+addEventListener("pageshow", ping);
+
 loadModels(); $("#q").focus();
 </script>
 </body>
