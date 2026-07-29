@@ -135,15 +135,6 @@ def loaded_models():
         return []
 
 
-def set_keep_alive(name, ka):
-    """Re-arm a loaded model's unload timer. No prompt, so nothing is generated."""
-    body = json.dumps({"model": name, "keep_alive": ka}).encode("utf-8")
-    req = urllib.request.Request(OLLAMA_HOST + "/api/generate", data=body,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)
-
-
 def apply_presence():
     """Point sticky models' keep_alive at the current tab situation, on change only.
 
