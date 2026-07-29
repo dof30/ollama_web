@@ -344,12 +344,23 @@ RULES:
 # OLLAMA (streaming, via stdlib — no extra dependency)
 # ========================================================================
 
+def chat_options():
+    """Runner options sent with EVERY request — and the single source of truth for them.
+
+    Ollama keys a loaded model on its options, so a request carrying different ones does
+    not reuse the resident copy: it evicts it and loads a fresh runner (~30s on a 120B).
+    Anything that talks to Ollama about a model we may already have loaded (re-arming
+    keep_alive, unloading) must send exactly these, or what should be a free timer touch
+    silently costs a full reload."""
+    return {"temperature": 0.4, "num_ctx": NUM_CTX}
+
+
 def ollama_chat_stream(model, messages, tools=None):
     payload = {
         "model": model,
         "messages": messages,
         "stream": True,
-        "options": {"temperature": 0.4, "num_ctx": NUM_CTX},
+        "options": chat_options(),
     }
     ka = keep_alive_for(model)
     if ka is not None:          # else defer to the server's global OLLAMA_KEEP_ALIVE

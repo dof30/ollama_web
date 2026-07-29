@@ -87,15 +87,28 @@ def list_models():
         return []
 
 
-def unload_model(name):
-    """Drop a model from RAM now. keep_alive=0 tells Ollama to unload immediately;
-    an empty prompt means it won't reload first. (NOT -1 — that pins a model in RAM
-    forever, which once wedged one with a year-2318 expiry.)"""
-    body = json.dumps({"model": name, "keep_alive": 0}).encode("utf-8")
-    req = urllib.request.Request(OLLAMA_HOST + "/api/generate", data=body,
+def set_keep_alive(name, keep_alive):
+    """Set how long `name` stays resident, without disturbing a running copy.
+
+    Mirrors agent.ollama_chat_stream's request exactly — same endpoint, same options —
+    with an empty message list so nothing is generated. The options are the whole point:
+    Ollama matches a request against the loaded runner's config, so re-arming with a
+    different num_ctx evicts the model and loads a fresh one instead of just touching
+    its timer. That turned an F5 into a 28s reload."""
+    payload = {"model": name, "messages": [], "stream": False,
+               "keep_alive": keep_alive, "options": agent.chat_options()}
+    req = urllib.request.Request(OLLAMA_HOST + "/api/chat",
+                                 data=json.dumps(payload).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with urllib.request.urlopen(req, timeout=120) as r:
         return json.load(r)
+
+
+def unload_model(name):
+    """Drop a model from RAM now. keep_alive=0 unloads immediately; no messages means
+    it won't generate. (NOT -1 — that pins RAM forever, and once wedged a model with a
+    year-2318 expiry.)"""
+    return set_keep_alive(name, 0)
 
 
 # ---------- tab presence -> how long the workhorse stays warm ----------
