@@ -297,7 +297,9 @@ HOW TO ACT — match your effort to the question:
    asks for deep research or the stakes clearly demand it.
 6. Write the FINAL ANSWER as normal prose (NOT JSON). If you used web sources,
    cite them inline as [1], [2], ... and list the full URLs under a "Sources:"
-   heading; note any disagreements between sources.
+   heading; note any disagreements between sources. Plain text and markdown
+   only: write math in plain symbols (169 GB ≈ 47 × 3.58 GB), NEVER LaTeX
+   markup (\\[ \\], \\text, \\frac), and never 【 】 citation tokens.
 
 RULES:
 - Never invent URLs, facts, numbers, or citations. Only cite pages you actually
@@ -330,7 +332,9 @@ HOW TO ACT — match your effort to the question:
    asks for deep research or the stakes clearly demand it.
 6. Write the FINAL ANSWER as normal prose. If you used web sources, cite them
    inline as [1], [2], ... and list the full URLs under a "Sources:" heading;
-   note any disagreements between sources.
+   note any disagreements between sources. Plain text and markdown only: write
+   math in plain symbols (169 GB ≈ 47 × 3.58 GB), NEVER LaTeX markup
+   (\\[ \\], \\text, \\frac), and never 【 】 citation tokens.
 
 RULES:
 - Never invent URLs, facts, numbers, or citations. Only cite pages you actually
@@ -456,6 +460,36 @@ def format_observation(tool, result):
         return "\n".join(lines) if lines else "(no results)"
     return str(result)
 
+# ---------- final-answer cleanup ----------
+# Some models decorate answers with notation a plain-markdown UI can't show:
+# gpt-oss leaks its internal browsing-citation tokens (【2†L1-L4】), and models
+# write formulas in LaTeX (\[ \text{Size} \approx 169\;\text{GB} \]) which
+# renders as raw backslash soup. Rendering real TeX would mean shipping KaTeX —
+# a heavy dependency for the occasional formula — so instead translate the
+# common constructs into readable plain text and drop the rest. The system
+# prompts also tell the model not to emit these; this pass is the guarantee.
+_TIDY_RULES = [
+    (re.compile(r"【[^】\n]{0,60}】"), ""),                 # 【2†L1-L4】 citation tokens
+    (re.compile(r"\\(?:text|mathrm|mathbf|mathit|operatorname)\{([^{}]*)\}"), r"\1"),
+    (re.compile(r"\\frac\{([^{}]*)\}\{([^{}]*)\}"), r"\1/\2"),
+    (re.compile(r"\\times\b"), "×"),
+    (re.compile(r"\\approx\b"), "≈"),
+    (re.compile(r"\\pm\b"), "±"),
+    (re.compile(r"\\cdot\b"), "·"),
+    (re.compile(r"\\(?:le|leq)\b"), "≤"),
+    (re.compile(r"\\(?:ge|geq)\b"), "≥"),
+    (re.compile(r"\\(?:;|,|:|!)"), " "),                   # LaTeX spacing commands
+    (re.compile(r"\\(?:quad|qquad)\b"), "  "),
+    (re.compile(r"\\[\[\]()]"), ""),                       # \[ \] \( \) math fences
+    (re.compile(r"\$\$"), ""),                             # $$ display fences ($ alone is money)
+]
+
+def tidy_answer(text):
+    """Make a final answer displayable: strip citation tokens, de-TeX math."""
+    for pat, rep in _TIDY_RULES:
+        text = pat.sub(rep, text)
+    return re.sub(r"\n{3,}", "\n\n", text)  # collapse holes left by removed fences
+
 # ========================================================================
 # AGENT LOOP
 # ========================================================================
@@ -511,7 +545,7 @@ def _synthesis(model, messages, instruction=SYNTH_FROM_EVIDENCE):
             content, thinking, _ = ev["_turn"]
         else:
             yield ev
-    yield {"type": "final", "text": (content or thinking).strip()}
+    yield {"type": "final", "text": tidy_answer((content or thinking).strip())}
 
 
 def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=None):
@@ -595,7 +629,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
                                        "Respond now with a web_fetch tool call (JSON only)."))})
                     continue
                 if content.strip():
-                    yield {"type": "final", "text": content.strip()}
+                    yield {"type": "final", "text": tidy_answer(content.strip())}
                     yield {"type": "done"}
                     return
                 # Empty content, no tool call anywhere: only internal reasoning came

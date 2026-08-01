@@ -317,7 +317,9 @@ function handle(ctx, ev){
           ctx.ans.insertBefore(ctx.ansLive, ctx.stream);
         }
       }
-      if(ctx.answering) ctx.ansLive.innerHTML = markdown(ctx.stepBuf);
+      // Strip gpt-oss's 【2†L1-L4】 citation tokens from the live view; the final
+      // event re-renders from server-side-cleaned text anyway (incl. de-TeXed math).
+      if(ctx.answering) ctx.ansLive.innerHTML = markdown(ctx.stepBuf.replace(/【[^】]*】/g,""));
       // else: still a forming tool call — not shown; the status line covers it.
       break;
     }
