@@ -188,7 +188,16 @@ convo.addEventListener("scroll", () => {
   lastTop = top;
   jump.classList.toggle("show", !stick);
 });
-function scrollDown(){ if(stick){ convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop; } }
+function selectionInside(el){
+  const s = window.getSelection();
+  return !!(s && !s.isCollapsed && s.anchorNode && el.contains(s.anchorNode));
+}
+// A live selection means the user is dragging to copy. Auto-scrolling under them
+// would yank the page mid-drag, so hold still until they let go.
+function scrollDown(){
+  if(!stick || selectionInside(convo)) return;
+  convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop;
+}
 function stickToBottom(){ stick = true; convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop; jump.classList.remove("show"); }
 jump.onclick = stickToBottom;
 
@@ -210,7 +219,7 @@ function newTurn(question){
   turns.appendChild(t); scrollDown();
   return {t, trace, sum, body, ans, stream,
           stepEl:null, thinkEl:null, srcEl:null, stepBuf:"", loadTimer:null,
-          answering:false, ansLive:null};
+          answering:false, ansLive:null, pendingRender:false};
 }
 
 function setStatus(ctx, label){   // live one-line status shown while the model works
@@ -235,6 +244,22 @@ function parkDraft(ctx){
   d.appendChild(live);                 // relocate the existing node (detaches it from .ans)
   (ctx.stepEl || ctx.body).appendChild(d);
 }
+
+// The answer is re-rendered on every streamed chunk, and `innerHTML =` rebuilds every
+// node underneath — which silently destroys a selection in progress. That is what made
+// a streaming answer impossible to select and copy. So while a selection is live inside
+// it, hold the render back and flush it the moment the selection is released.
+let liveCtx = null;
+function renderLive(ctx){
+  if(!ctx.ansLive) return;
+  if(selectionInside(ctx.ansLive)){ ctx.pendingRender = true; return; }
+  ctx.pendingRender = false;
+  ctx.ansLive.innerHTML = markdown(ctx.stepBuf);
+}
+document.addEventListener("selectionchange", () => {
+  if(liveCtx && liveCtx.pendingRender && liveCtx.ansLive && !selectionInside(liveCtx.ansLive))
+    renderLive(liveCtx);
+});
 
 // ---- consume the SSE stream ----
 async function ask(question){
@@ -301,7 +326,9 @@ function handle(ctx, ev){
       break;
     }
     case "thinking":
-      if(ctx.thinkEl) ctx.thinkEl.textContent += ev.text;
+      // append, not `textContent +=`: the latter replaces the whole text node and
+      // takes any selection over the reasoning with it.
+      if(ctx.thinkEl) ctx.thinkEl.append(ev.text);
       setStatus(ctx, "thinking…"); break;
     case "answer_chunk":{
       ctx.stepBuf += ev.text;
@@ -315,9 +342,10 @@ function handle(ctx, ev){
           setDone(ctx, true);                 // mark the trace done (stays collapsed)
           ctx.ansLive = document.createElement("div");
           ctx.ans.insertBefore(ctx.ansLive, ctx.stream);
+          liveCtx = ctx;
         }
       }
-      if(ctx.answering) ctx.ansLive.innerHTML = markdown(ctx.stepBuf);
+      if(ctx.answering) renderLive(ctx);
       // else: still a forming tool call — not shown; the status line covers it.
       break;
     }
@@ -347,7 +375,11 @@ function handle(ctx, ev){
       (ctx.stepEl||ctx.body).appendChild(c); break;
     }
     case "final":{
-      ctx.ans.innerHTML = markdown(ev.text);
+      // The live render already holds exactly this text in the normal case, so
+      // rebuilding it would reflow for no visual change — and wipe a selection right
+      // at the finish line. Only rebuild when the authoritative text actually differs.
+      const same = ctx.ansLive && ctx.stepBuf.trim() === (ev.text || "").trim();
+      if(!same) ctx.ans.innerHTML = markdown(ev.text);
       const bar=document.createElement("div"); bar.className="answerbar";
       const b=document.createElement("button"); b.textContent="Copy";
       b.onclick=()=>{ navigator.clipboard.writeText(ev.text); b.textContent="Copied ✓";

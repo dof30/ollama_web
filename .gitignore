@@ -4,3 +4,6 @@ __pycache__/
 *.egg-info/
 .env
 nohup.out
+
+# Local copy of this repo downloaded from GitHub — not part of the source tree.
+ollama_web-main*/

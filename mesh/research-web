@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# research-web — one-shot launcher for the local research web UI (mesh edition).
+#
+#   research-web            start the server if needed, then open the browser
+#   research-web --stop     stop the background server
+#   research-web --status   show whether it's running and where
+#   research-web --warm     load both models now, so the first question is instant
+#
+# Safe to run repeatedly: if a server is already up it just opens the browser.
+
+PY=/home/kong/miniforge3/bin/python3
+REPO=/home/kong/Local_LLM_web
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/research-web.log"
+mkdir -p "$(dirname "$LOG")"
+
+find_running() {  # echoes the port of an already-running instance, if any
+  for p in $(seq 8765 8774); do
+    if curl -sf --max-time 1 "http://127.0.0.1:$p/api/models" 2>/dev/null \
+        | grep -q '"app": "local-research"'; then
+      echo "$p"; return 0
+    fi
+  done
+  return 1
+}
+
+case "$1" in
+  --stop)
+    # Match the module form the server is actually started with.
+    if pkill -f "mesh.server"; then echo "research web UI stopped"; else echo "not running"; fi
+    exit 0 ;;
+  --status)
+    PORT=$(find_running) && echo "running at http://127.0.0.1:$PORT" || echo "not running"
+    exit 0 ;;
+  --warm)
+    cd "$REPO" && "$PY" -c "from mesh import ollama; ollama.warm(); print('both models warm')"
+    exit 0 ;;
+esac
+
+PORT=$(find_running)
+if [ -z "$PORT" ]; then
+  echo "starting server… (log: $LOG)"
+  # cd into the repo so `python3 -m mesh.server` resolves the package.
+  (cd "$REPO" && nohup "$PY" -m mesh.server >>"$LOG" 2>&1 &)
+  for _ in $(seq 1 40); do
+    PORT=$(find_running) && break
+    sleep 0.25
+  done
+fi
+
+if [ -z "$PORT" ]; then
+  echo "server did not come up — last log lines:"
+  tail -5 "$LOG"
+  exit 1
+fi
+
+URL="http://127.0.0.1:$PORT"
+echo "research web UI → $URL"
+xdg-open "$URL" >/dev/null 2>&1 || echo "(couldn't auto-open a browser — open $URL yourself)"
