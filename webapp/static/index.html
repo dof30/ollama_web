@@ -133,14 +133,23 @@
   textarea{flex:1;resize:none;min-height:var(--qmin);max-height:180px;font:inherit;color:var(--ink);
            background:var(--bg);border:1px solid var(--line);border-radius:10px;
            padding:10px 48px 10px 12px}   /* right padding clears the send button */
+  /* The browser's default focus ring follows the OS accent colour, which painted the
+     box a loud red/amber. Replace it with a quiet grey rim — still an obvious focus
+     cue, but it stops the composer shouting while you type. */
+  textarea:focus{outline:none;border-color:var(--dim)}
   /* The send button lives INSIDE the prompt box, pinned to its bottom-right corner
      (it stays put while the box grows), the way chat apps put the arrow in the field.
      No background disc — the bare sign carries the state through its colour alone. */
   .qwrap{position:relative;flex:1;display:flex}
-  #send{position:absolute;right:7px;bottom:5px;width:32px;height:32px;padding:0;
+  #send{position:absolute;right:7px;bottom:6px;width:32px;height:32px;padding:0;
         background:none;border:none;color:var(--accent);font-size:19px;line-height:1;
         display:flex;align-items:center;justify-content:center}
+  /* The stop sign is drawn, not typed: a font glyph sits on its baseline, which parks
+     it low in the button no matter how the box is centred. An empty bordered box is
+     centred by the flex rules above, and being a border it can't read as "filled". */
   #send.stopping{color:var(--stop)}
+  #send.stopping::before{content:"";width:13px;height:13px;
+                         border:2px solid currentColor;border-radius:3px}
   .hint{color:var(--dim);font-size:12px;margin-top:6px;text-align:center}
   #jump{position:fixed;right:22px;bottom:104px;z-index:5;display:none;cursor:pointer;
         background:var(--accent);color:var(--accent-ink);border:none;border-radius:18px;
@@ -481,7 +490,7 @@ function reAsk(text){
 function sendMode(mode){
   const b=$("#send"), stopping = mode==="stop";
   b.classList.toggle("stopping", stopping);
-  b.textContent = stopping ? "■" : "⏎";   // return sign to send, end sign to stop
+  b.textContent = stopping ? "" : "⏎";   // stop is drawn by CSS; send is the return sign
   b.title = stopping ? "Stop the answer — your question comes back to edit"
                      : "Send — or press Enter";
 }
