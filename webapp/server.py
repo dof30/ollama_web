@@ -72,11 +72,6 @@ DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "gpt-oss:120b-fast")
 # plain dict is fine; restart clears it (like the CLI's /reset).
 SESSIONS = {}
 
-# Session ids whose user pressed "Answer now": the running research loop polls this
-# set between steps and, if its sid is here, stops searching and writes the answer
-# from what it has. Set from a separate request thread; GIL makes add/discard safe.
-WRAP_UP = set()
-
 # sid -> id of the newest turn started for it. Turns can overlap (Stop, then re-ask
 # before the stopped thread has noticed the dead connection), and only the newest one
 # is allowed to write back to the session. The lock covers both this and SESSIONS.
@@ -281,16 +276,6 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(502, json.dumps({"error": f"{type(e).__name__}: {e}"}))
             return
-        if self.path == "/api/answer_now":
-            length = int(self.headers.get("Content-Length", 0))
-            try:
-                req = json.loads(self.rfile.read(length) or b"{}")
-            except Exception:
-                self._send(400, json.dumps({"error": "bad json"}))
-                return
-            WRAP_UP.add(req.get("sid") or "default")
-            self._send(200, json.dumps({"ok": True}))
-            return
         if self.path != "/api/ask":
             self._send(404, json.dumps({"error": "not found"}))
             return
@@ -317,7 +302,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         messages = SESSIONS.setdefault(sid, engine.new_conversation())
-        WRAP_UP.discard(sid)      # a leftover flag from a past run must not cut this one short
         # Claim the session, then work on a private copy. A stopped turn's thread keeps
         # running until its next write fails, so it can still be alive when the next
         # question arrives; the copy keeps the two loops from corrupting each other's
@@ -337,8 +321,7 @@ class Handler(BaseHTTPRequestHandler):
         aborted = False
         t0 = time.time()
         try:
-            for ev in engine.research_events(model, work, min_sources=depth, effort=effort,
-                                             should_wrap_up=lambda: sid in WRAP_UP):
+            for ev in engine.research_events(model, work, min_sources=depth, effort=effort):
                 if ev.get("type") == "final":
                     final_text = ev.get("text", "")
                 elif ev.get("type") == "source":
@@ -351,9 +334,8 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             with _session_lock:
                 # Only the newest turn owns this session. A superseded one must not
-                # clear the new run's wrap-up flag or graft its stale answer on.
+                # graft its stale answer onto the session.
                 if TURNS.get(sid) == turn_id:
-                    WRAP_UP.discard(sid)  # this run is over; don't leak the flag
                     if not aborted:
                         # Keep only the clean Q+A: the turn's research bulk is
                         # discarded with its working copy, so a long conversation

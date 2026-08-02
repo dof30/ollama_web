@@ -577,20 +577,13 @@ def effort_for(min_sources):
     return "low" if min_sources < 3 else "high"   # Quick (1 source) / Deep (5 sources)
 
 
-def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=None,
-                    effort=None):
+def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
     """The research loop as a STREAM OF EVENTS — the single source of truth behind
     both the terminal renderer (run_agent) and the web UI (webapp/engine.py). It
     drives the ReAct tool loop, mutating `messages` in place so follow-ups keep
     context. A depth gate (min_sources > 0) blocks a premature answer until enough
     distinct pages are read. Event types: step / thinking / answer_chunk /
     tool_call / observation / source / notice / final / error / done.
-
-    should_wrap_up, if given, is a zero-arg predicate polled at the top of every
-    step. When it returns true (the user pressed "Answer now") the loop stops
-    researching immediately and synthesizes an answer from whatever it has so far —
-    the escape hatch for a model that keeps re-searching a question it could already
-    answer. It overrides the depth gate: an explicit "answer now" beats "too shallow".
 
     Tool protocol is chosen per model: native Ollama tool calling when the model
     supports it (calls arrive parsed, in the channel the model was trained on),
@@ -614,14 +607,8 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
     stalls = 0              # turns that returned only reasoning — no answer, no call
     searches_in_a_row = 0   # list-tool calls since the last web_fetch (loop detector)
 
-    def wrap():
-        return bool(should_wrap_up and should_wrap_up())
-
     try:
         for step in range(1, MAX_STEPS + 1):
-            if wrap():
-                yield {"type": "notice", "text": "answer now — writing up what we have"}
-                break
             yield {"type": "step", "n": step}
 
             content = thinking = ""
@@ -646,7 +633,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
 
             if not calls:
                 # Model wants to finalize. Enforce depth unless it has read enough.
-                if len(read_domains) < min_sources and nudges < MAX_NUDGES and not wrap():
+                if len(read_domains) < min_sources and nudges < MAX_NUDGES:
                     nudges += 1
                     yield {"type": "notice",
                            "text": f"too shallow ({len(read_domains)}/{min_sources} read) — reading more"}
@@ -669,7 +656,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
                 # back. Nudge it to actually emit the call (or the answer) rather than
                 # forcing synthesis, which would answer from stale memory without ever
                 # searching. Bounded so a stuck model still terminates.
-                if stalls < MAX_NUDGES and not wrap():
+                if stalls < MAX_NUDGES:
                     stalls += 1
                     yield {"type": "notice", "text": "described a tool call but didn't emit it — nudging"}
                     messages.append({"role": "user", "content": (
@@ -691,14 +678,6 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
                 return
 
             # --- tools were requested (a native model may batch several per turn) ---
-            if wrap():
-                # Drop the un-run calls and flatten the assistant turn to plain text
-                # so no chat template sees a tool call that never got a reply.
-                if messages and messages[-1].get("tool_calls"):
-                    messages[-1] = {"role": "assistant",
-                                    "content": messages[-1].get("content") or "(research cut short by user)"}
-                yield {"type": "notice", "text": "answer now — skipping further research"}
-                break
             for tool, args in calls:
                 label = args.get("query") or args.get("url") or ""
                 yield {"type": "tool_call", "tool": tool, "label": label}
