@@ -262,8 +262,9 @@ def date_stamp():
 
 def stamp_current_question(messages):
     """Append today's date to the question being answered. Only the live turn
-    carries a stamp: compact_turn later rewrites the turn with the clean question,
-    so stamps never pile up in history. Idempotent in case of a double call."""
+    carries a stamp: it is applied to the turn's own working copy, and the session
+    keeps the clean question, so stamps never pile up in history. Idempotent in case
+    of a double call."""
     if not messages or messages[-1].get("role") != "user":
         return
     if DATE_STAMP_PREFIX in messages[-1]["content"]:
@@ -359,7 +360,7 @@ def chat_options():
     return {"temperature": 0.4, "num_ctx": NUM_CTX}
 
 
-def ollama_chat_stream(model, messages, tools=None):
+def ollama_chat_stream(model, messages, tools=None, effort=None):
     payload = {
         "model": model,
         "messages": messages,
@@ -371,6 +372,8 @@ def ollama_chat_stream(model, messages, tools=None):
         payload["keep_alive"] = ka
     if tools:
         payload["tools"] = tools
+    if effort:                  # else the model's template default (medium)
+        payload["think"] = effort
     req = urllib.request.Request(
         OLLAMA_HOST + "/api/chat", data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
@@ -494,7 +497,7 @@ def tidy_answer(text):
 # AGENT LOOP
 # ========================================================================
 
-def _stream_turn(model, messages, tools=None):
+def _stream_turn(model, messages, tools=None, effort=None):
     """Stream one model completion, yielding {"type":"answer_chunk"|"thinking"} as
     tokens arrive, then a final {"_turn": (content, thinking, native_calls)}
     sentinel, where native_calls is a list of (tool, args) that arrived through
@@ -503,7 +506,7 @@ def _stream_turn(model, messages, tools=None):
     hide the answer or the tool call in either, so we surface both and let the
     caller decide. This is the one streaming primitive behind both the CLI and web."""
     content, thinking, native_calls = "", "", []
-    for kind, chunk in ollama_chat_stream(model, messages, tools):
+    for kind, chunk in ollama_chat_stream(model, messages, tools, effort):
         if kind == "content":
             content += chunk
             yield {"type": "answer_chunk", "text": chunk}
@@ -514,8 +517,19 @@ def _stream_turn(model, messages, tools=None):
             native_calls.append(chunk)  # already-parsed (tool, args)
     if native_calls:
         # Echo the turn back in native form so the model's chat template renders
-        # the calls the way it was trained to see them.
+        # the calls the way it was trained to see them — reasoning included.
+        #
+        # The `thinking` is not decoration here. gpt-oss plans its research inside
+        # the analysis channel ("search X, then open the spec page, then compare"),
+        # and harmony requires that reasoning be fed back while a tool loop is still
+        # running, or the model re-reads its own history with the plan amputated and
+        # re-derives it every step. Ollama's template renders it back into the
+        # analysis channel only for messages *after the last user message*, which is
+        # exactly harmony's rule — reasoning survives the in-flight turn and is
+        # dropped once the turn closes. commit_turn stores only the clean Q+A, so
+        # nothing leaks into the next turn.
         messages.append({"role": "assistant", "content": content,
+                         "thinking": thinking,
                          "tool_calls": [{"function": {"name": n, "arguments": a}}
                                         for n, a in native_calls]})
     else:
@@ -534,18 +548,33 @@ SYNTH_FROM_KNOWLEDGE = (
     "you need to search. Answer the question directly from your own knowledge, as "
     "prose. If you are not fully certain, say so in one short line at the end.")
 
-def _synthesis(model, messages, instruction=SYNTH_FROM_EVIDENCE):
+def _synthesis(model, messages, instruction=SYNTH_FROM_EVIDENCE, effort=None):
     """Force a written answer: stream it as answer chunks, then end with a `final`
     event carrying the whole text. No `tools` are passed here, so in native mode
     the model cannot call anything even if it wants to — prose is the only exit."""
     messages.append({"role": "user", "content": instruction})
     content = thinking = ""
-    for ev in _stream_turn(model, messages):
+    for ev in _stream_turn(model, messages, effort=effort):
         if "_turn" in ev:
             content, thinking, _ = ev["_turn"]
         else:
             yield ev
     yield {"type": "final", "text": tidy_answer((content or thinking).strip())}
+
+
+def effort_for(min_sources):
+    """Map the depth the user asked for onto gpt-oss's reasoning effort.
+
+    Reasoning effort is this model's main dial and costs nothing to set: the same
+    weights answer at three depths of deliberation. OpenAI's own numbers show the
+    agentic benchmarks gain the most from it (Tau-Bench Retail 49->68, SWE-Bench
+    48->62 going low->high), which is exactly the multi-step tool work this loop
+    does — while `low` makes a quick lookup noticeably snappier. So the depth
+    selector now governs how hard it thinks as well as how much it must read.
+    Returns None for Auto, leaving the template's own default (medium)."""
+    if min_sources <= 0:
+        return None                       # Auto — the model matches effort to the question
+    return "low" if min_sources < 3 else "high"   # Quick (1 source) / Deep (5 sources)
 
 
 def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=None):
@@ -567,11 +596,12 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
     otherwise the original in-band JSON protocol. The in-band parser also stays on
     as a safety net in native mode, catching a model that writes JSON as text."""
     native = model_supports_tools(model)
+    effort = effort_for(min_sources)
     tools = TOOL_SPECS if native else None
     # The two protocols need different instructions, the user can switch models
     # mid-session, and the date block must stay current in long-lived sessions —
     # so refresh the system prompt on every call. messages[0] is always the
-    # system message (compact_turn preserves it).
+    # system message (every working copy starts from it).
     if messages and messages[0].get("role") == "system":
         messages[0]["content"] = system_prompt(native)
     stamp_current_question(messages)  # date lands next to the question, where attention is
@@ -593,7 +623,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
 
             content = thinking = ""
             calls = []
-            for ev in _stream_turn(model, messages, tools):
+            for ev in _stream_turn(model, messages, tools, effort):
                 if "_turn" in ev:
                     content, thinking, calls = ev["_turn"]
                 else:
@@ -652,7 +682,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
                 # Nudges exhausted: if it researched, synthesize from that; else answer
                 # from its own knowledge (never surface raw "I need to search" reasoning).
                 instr = SYNTH_FROM_EVIDENCE if read_domains else SYNTH_FROM_KNOWLEDGE
-                for ev in _synthesis(model, messages, instr):
+                for ev in _synthesis(model, messages, instr, effort):
                     yield ev
                 yield {"type": "done"}
                 return
@@ -715,7 +745,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
                 break
 
         instr = SYNTH_FROM_EVIDENCE if read_domains else SYNTH_FROM_KNOWLEDGE
-        for ev in _synthesis(model, messages, instr):
+        for ev in _synthesis(model, messages, instr, effort):
             yield ev
         yield {"type": "done"}
     except Exception as e:
