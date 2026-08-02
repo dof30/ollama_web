@@ -31,8 +31,6 @@
   header .title small{color:var(--dim);font-weight:400}
   select,button{font:inherit;color:var(--ink);background:var(--panel);
                 border:1px solid var(--line);border-radius:8px;padding:6px 10px;cursor:pointer}
-  button.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent}
-  button.primary.stopping{background:var(--stop);color:var(--stop-ink)}
   button:disabled{opacity:.5;cursor:default}
   #convo{flex:1;overflow-y:auto;padding:20px 0}
   .wrap{max-width:820px;margin:0 auto;padding:0 16px}
@@ -86,17 +84,25 @@
   /* Three cups; the water level is how hard the model thinks. No labels — the shape
      carries the meaning, and hovering names the level. */
   .effortpick{display:flex;align-items:center;gap:8px;--lvl:var(--dim)}
-  /* takes the colour of the chosen level, so the word reads as part of the control */
-  .effortword{color:var(--lvl);font-size:12px;font-weight:600;white-space:nowrap;
+  /* The word rides the bottom rim of the cups box like a fieldset legend — half
+     above the line, half below. Panel background so it interrupts the border
+     cleanly, and it takes the chosen level's colour. */
+  .effortword{position:absolute;left:50%;bottom:0;transform:translate(-50%,50%);
+              background:var(--panel);padding:0 6px;
+              color:var(--lvl);font-size:12px;font-weight:600;white-space:nowrap;
               transition:color .2s}
   .effortpick[data-level="low"]   {--lvl:#7f93a8}   /* slate — quick sip          */
   .effortpick[data-level="medium"]{--lvl:#4ea1ff}   /* blue  — the everyday glass */
-  .effortpick[data-level="high"]  {--lvl:#b483ff}   /* violet — filled to the brim */
+  /* Orange, not another cool tone: low and medium already ramp slate -> blue, so a
+     warm top step reads as heat rather than just "more blue", and it can't be
+     mistaken for the everyday level at a glance. */
+  .effortpick[data-level="high"]  {--lvl:#ff8b30}   /* orange — filled to the brim */
   /* Fills its parent's height, so the footer reads as one block rather than a row of
      floating widgets. Tight padding keeps the cups themselves tall inside it. */
   /* The negative bottom margin lets the cups reach down past the composer, level with
      the hint line, so they get real height without making the input taller. */
-  .cups{display:flex;align-items:flex-end;gap:7px;padding:6px 9px;background:var(--panel);
+  .cups{position:relative;display:flex;align-items:flex-end;gap:7px;padding:6px 9px 10px;
+        background:var(--panel);
         border:1px solid var(--line);border-radius:12px;margin-bottom:-21px}
   .cup{position:relative;width:24px;height:63px;padding:0;cursor:pointer;
        background:var(--bg);border:1px solid var(--line);border-radius:3px 3px 9px 9px;
@@ -125,7 +131,16 @@
      The height was never the problem — the disagreement was. CSS and JS now share
      --qmin, so it opens at one row and stays there until the text needs more. */
   textarea{flex:1;resize:none;min-height:var(--qmin);max-height:180px;font:inherit;color:var(--ink);
-           background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+           background:var(--bg);border:1px solid var(--line);border-radius:10px;
+           padding:10px 48px 10px 12px}   /* right padding clears the send button */
+  /* The send button lives INSIDE the prompt box, pinned to its bottom-right corner
+     (it stays put while the box grows), the way chat apps put the arrow in the field.
+     No background disc — the bare sign carries the state through its colour alone. */
+  .qwrap{position:relative;flex:1;display:flex}
+  #send{position:absolute;right:7px;bottom:5px;width:32px;height:32px;padding:0;
+        background:none;border:none;color:var(--accent);font-size:19px;line-height:1;
+        display:flex;align-items:center;justify-content:center}
+  #send.stopping{color:var(--stop)}
   .hint{color:var(--dim);font-size:12px;margin-top:6px;text-align:center}
   #jump{position:fixed;right:22px;bottom:104px;z-index:5;display:none;cursor:pointer;
         background:var(--accent);color:var(--accent-ink);border:none;border-radius:18px;
@@ -150,8 +165,10 @@
     <div class="composer">
       <!-- rows=1: without it the browser opens the box at its default TWO rows, which
            min-height can't shrink, and the first keystroke snapped it down to one. -->
-      <textarea id="q" rows="1" placeholder="Ask anything — parentheses, quotes, symbols all fine here."></textarea>
-      <button id="send" class="primary">Send</button>
+      <div class="qwrap">
+        <textarea id="q" rows="1" placeholder="Ask anything — parentheses, quotes, symbols all fine here."></textarea>
+        <button id="send" title="Send — or press Enter">⏎</button>
+      </div>
       <div class="effortpick" data-level="medium">
         <!-- A hidden input carries the value so ask() keeps reading #effort as before.
              autocomplete=off so a reload can't resurrect a stale pick over the default. -->
@@ -163,8 +180,8 @@
                   title="medium — the everyday level (default)" aria-label="medium intelligence"><span class="water"></span></button>
           <button type="button" class="cup" data-level="high"
                   title="high — thinks long and hard before answering" aria-label="high intelligence"><span class="water"></span></button>
+          <small class="effortword">capacity</small>
         </div>
-        <small class="effortword">capacity</small>
       </div>
     </div>
     <div class="hint" id="hint">Enter to send · Shift+Enter for a new line · everything runs locally</div>
@@ -464,8 +481,9 @@ function reAsk(text){
 function sendMode(mode){
   const b=$("#send"), stopping = mode==="stop";
   b.classList.toggle("stopping", stopping);
-  b.textContent = stopping ? "Stop" : "Send";
-  b.title = stopping ? "Stop the answer — your question comes back to edit" : "";
+  b.textContent = stopping ? "■" : "⏎";   // return sign to send, end sign to stop
+  b.title = stopping ? "Stop the answer — your question comes back to edit"
+                     : "Send — or press Enter";
 }
 // Double-click protection, both directions. The same button sends and stops, so
 // the second click of a double-click always lands in the OPPOSITE mode: right
