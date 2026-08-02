@@ -90,10 +90,13 @@ def commit_turn(messages, question, answer):
 # truth shared by the terminal renderer (agent.run_agent) and this web engine. We
 # wrap it at call time (rather than aliasing the function object) so a hot-reload of
 # agent.py is picked up on the very next request without reloading this module too.
-def research_events(model, messages, min_sources=0, should_wrap_up=None):
+def research_events(model, messages, min_sources=0, should_wrap_up=None, effort=None):
     """Yield research events for the web UI. The event contract is documented in
     this file's header; the implementation is agent.research_events.
     should_wrap_up: zero-arg predicate polled each step — true means the user hit
-    "Answer now", so stop researching and write up what's already gathered."""
+    "Answer now", so stop researching and write up what's already gathered.
+    effort: the intelligence level chosen in the UI ("low"/"medium"/"high"), handed
+    straight to the model as its reasoning effort. None lets the CLI's source-count
+    heuristic pick one instead."""
     yield from agent.research_events(model, messages, min_sources=min_sources,
-                                     should_wrap_up=should_wrap_up)
+                                     should_wrap_up=should_wrap_up, effort=effort)

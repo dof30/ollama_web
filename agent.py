@@ -577,7 +577,8 @@ def effort_for(min_sources):
     return "low" if min_sources < 3 else "high"   # Quick (1 source) / Deep (5 sources)
 
 
-def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=None):
+def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=None,
+                    effort=None):
     """The research loop as a STREAM OF EVENTS — the single source of truth behind
     both the terminal renderer (run_agent) and the web UI (webapp/engine.py). It
     drives the ReAct tool loop, mutating `messages` in place so follow-ups keep
@@ -596,7 +597,9 @@ def research_events(model, messages, min_sources=MIN_SOURCES, should_wrap_up=Non
     otherwise the original in-band JSON protocol. The in-band parser also stays on
     as a safety net in native mode, catching a model that writes JSON as text."""
     native = model_supports_tools(model)
-    effort = effort_for(min_sources)
+    # The web UI names the level outright; the CLI only says how many sources it
+    # wants, so infer one from that.
+    effort = effort or effort_for(min_sources)
     tools = TOOL_SPECS if native else None
     # The two protocols need different instructions, the user can switch models
     # mid-session, and the date block must stay current in long-lived sessions —

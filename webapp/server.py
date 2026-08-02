@@ -83,6 +83,13 @@ WRAP_UP = set()
 TURNS = {}
 _session_lock = threading.Lock()
 
+# Intelligence is how hard the model THINKS, not how much it is forced to read. An
+# earlier version armed the depth gate at "high", and asking for three prime numbers
+# then took 124s because the gate made it web_fetch five sites for a maths question.
+# The gate stays available to the CLI (--deep) and to the legacy `depth` field; the
+# selector leaves it off so effort stays proportional to the question.
+EFFORT_SOURCES = {"high": 0, "medium": 0, "low": 0}
+
 
 def list_models():
     try:
@@ -296,8 +303,15 @@ class Handler(BaseHTTPRequestHandler):
 
         question = (req.get("q") or "").strip()
         model = req.get("model") or DEFAULT_MODEL
-        depth = int(req.get("depth") or 0)
         sid = req.get("sid") or "default"
+        # The UI sends an intelligence level; gpt-oss takes it as reasoning effort.
+        # "high" also opens the depth gate, so thinking harder means reading more
+        # rather than only deliberating longer. `depth` is the older field name and
+        # is still honoured so a stale cached page keeps working.
+        effort = (req.get("effort") or "").strip().lower()
+        if effort not in ("low", "medium", "high"):
+            effort = None
+        depth = EFFORT_SOURCES.get(effort, int(req.get("depth") or 0))
         if not question:
             self._send(400, json.dumps({"error": "empty question"}))
             return
@@ -323,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
         aborted = False
         t0 = time.time()
         try:
-            for ev in engine.research_events(model, work, min_sources=depth,
+            for ev in engine.research_events(model, work, min_sources=depth, effort=effort,
                                              should_wrap_up=lambda: sid in WRAP_UP):
                 if ev.get("type") == "final":
                     final_text = ev.get("text", "")
