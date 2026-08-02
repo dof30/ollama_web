@@ -14,7 +14,9 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/research-web.log"
 mkdir -p "$(dirname "$LOG")"
 
 find_running() {  # echoes the port of an already-running instance, if any
-  for p in $(seq 8765 8774); do
+  # Probe 8765-8769 ONLY: the mesh app (~/Local_Mesh_web) lives on 8770+ and answers
+  # the same identity marker, so scanning further would find IT and open the wrong app.
+  for p in $(seq 8765 8769); do
     if curl -sf --max-time 1 "http://127.0.0.1:$p/api/models" 2>/dev/null \
         | grep -q '"app": "local-research"'; then
       echo "$p"; return 0

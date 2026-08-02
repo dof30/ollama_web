@@ -42,25 +42,45 @@ def new_conversation():
 MAX_HISTORY_TURNS = int(os.environ.get("RESEARCH_MAX_HISTORY_TURNS", "8"))
 
 
-def compact_turn(messages, base_len, question, answer):
-    """Collapse a just-finished turn down to a clean question + answer.
+def start_turn(messages, question):
+    """A private working copy of the conversation for one turn, ending in `question`.
 
-    During research the loop appends a lot of bulk to `messages` — tool-call JSON,
-    and OBSERVATION messages holding whole fetched pages (up to ~1.5k tokens each).
-    That detail is essential *while* researching but only crowds the context window
-    afterwards. Left in place across turns it silently overflows num_ctx: Ollama
-    then truncates from the top (losing the system prompt) and can run out of room
-    to generate, which is what makes a multi-turn session "fold" mid-answer.
+    The research loop appends a lot of bulk as it goes — tool-call JSON, and
+    OBSERVATION messages holding whole fetched pages — and it must never do that to
+    the live session list. Two turns can overlap: press Stop and re-ask, and the
+    browser unlocks Send immediately while the stopped turn's server thread lives on
+    until its next write fails. Sharing one list means those two loops interleave
+    their scratch work, and whichever finishes first truncates the other's context
+    out from under it mid-generation.
 
-    So after each turn we throw away everything the loop added and keep just the
-    user's question and the final answer — the model still remembers the thread of
-    the conversation, at a fraction of the tokens. We also cap how many past turns
-    we retain. `base_len` is len(messages) *before* this turn's question was added.
+    Each message dict is copied, not just the list: agent.py stamps the date onto the
+    last message and rewrites the system prompt in place, which would otherwise reach
+    through the copy and edit the session's own messages.
     """
-    del messages[base_len:]
+    work = [dict(m) for m in messages]
+    work.append({"role": "user", "content": question})
+    return work
+
+
+def commit_turn(messages, question, answer):
+    """Add one finished turn to the session as a clean question + answer pair.
+
+    Every bit of research scratch work stays behind in that turn's working copy. Left
+    in the session it would silently overflow num_ctx: Ollama then truncates from the
+    top (losing the system prompt) and can run out of room to generate, which is what
+    used to make a long session "fold" mid-answer. The question stored here is the
+    clean one from the request, not the date-stamped copy the loop worked with.
+
+    A turn that produced no answer (Stop, or an error) is dropped WHOLE. Keeping the
+    question alone would leave a user message with no reply, so the next question
+    lands as a second user message in a row and the model stops reading it as a
+    follow-up — that is what made a stopped-then-reworded question arrive with the
+    earlier conversation apparently forgotten.
+    """
+    if not answer:
+        return
     messages.append({"role": "user", "content": question})
-    if answer:
-        messages.append({"role": "assistant", "content": answer})
+    messages.append({"role": "assistant", "content": answer})
     keep = 1 + MAX_HISTORY_TURNS * 2  # system prompt + N (user, assistant) pairs
     if len(messages) > keep:
         del messages[1:len(messages) - (keep - 1)]  # drop oldest turns, keep system

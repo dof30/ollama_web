@@ -77,6 +77,12 @@ SESSIONS = {}
 # from what it has. Set from a separate request thread; GIL makes add/discard safe.
 WRAP_UP = set()
 
+# sid -> id of the newest turn started for it. Turns can overlap (Stop, then re-ask
+# before the stopped thread has noticed the dead connection), and only the newest one
+# is allowed to write back to the session. The lock covers both this and SESSIONS.
+TURNS = {}
+_session_lock = threading.Lock()
+
 
 def list_models():
     try:
@@ -174,6 +180,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):  # keep the console quiet
         pass
+
+    def handle_one_request(self):
+        # Pressing Stop or closing the tab mid-answer leaves http.server flushing into
+        # a socket that is already gone. That is a normal end to a run, but it dumps a
+        # twelve-line traceback into the log each time, which buries real errors.
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def _local_ok(self):
         """True only when the request is addressed to this machine. Browsers stop a
@@ -289,8 +304,13 @@ class Handler(BaseHTTPRequestHandler):
 
         messages = SESSIONS.setdefault(sid, engine.new_conversation())
         WRAP_UP.discard(sid)      # a leftover flag from a past run must not cut this one short
-        base_len = len(messages)  # remember where this turn starts, for compaction
-        messages.append({"role": "user", "content": question})
+        # Claim the session, then work on a private copy. A stopped turn's thread keeps
+        # running until its next write fails, so it can still be alive when the next
+        # question arrives; the copy keeps the two loops from corrupting each other's
+        # context, and turn_id stops the older one writing back over the newer answer.
+        with _session_lock:
+            turn_id = TURNS[sid] = TURNS.get(sid, 0) + 1
+        work = engine.start_turn(messages, question)
 
         # Stream events as Server-Sent-Events style frames.
         self.send_response(200)
@@ -300,9 +320,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         final_text = ""
         sources = []
+        aborted = False
         t0 = time.time()
         try:
-            for ev in engine.research_events(model, messages, min_sources=depth,
+            for ev in engine.research_events(model, work, min_sources=depth,
                                              should_wrap_up=lambda: sid in WRAP_UP):
                 if ev.get("type") == "final":
                     final_text = ev.get("text", "")
@@ -312,12 +333,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(frame.encode("utf-8"))
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            pass  # browser navigated away / stopped the run
+            aborted = True  # browser navigated away / stopped the run
         finally:
-            WRAP_UP.discard(sid)  # this run is over; don't leak the flag into the next
-            # Shrink this turn back to a clean Q+A so the next turn starts lean and
-            # the session can't overflow the context window over a long conversation.
-            engine.compact_turn(messages, base_len, question, final_text)
+            with _session_lock:
+                # Only the newest turn owns this session. A superseded one must not
+                # clear the new run's wrap-up flag or graft its stale answer on.
+                if TURNS.get(sid) == turn_id:
+                    WRAP_UP.discard(sid)  # this run is over; don't leak the flag
+                    if not aborted:
+                        # Keep only the clean Q+A: the turn's research bulk is
+                        # discarded with its working copy, so a long conversation
+                        # can't creep up on the context window.
+                        engine.commit_turn(messages, question, final_text)
             # Lock the finished turn away in the local history DB (write-only from
             # here; read it later with `python3 webapp/history.py`).
             history.record(sid, model, depth, question, final_text,
