@@ -109,6 +109,14 @@ def web_fetch(url):
     resp = requests.get(url, headers={"User-Agent": UA}, timeout=25)
     resp.raise_for_status()
     ctype = resp.headers.get("content-type", "")
+    if "pdf" in ctype.lower() or resp.content[:5] == b"%PDF-":
+        # Without this, a PDF arrives as compressed-binary soup: the model burns a
+        # step reading garbage, concludes "maybe another PDF will extract better",
+        # and burns the next step the same way (watched it happen twice in a row).
+        return (f"URL: {url}\n[This is a PDF — web_fetch cannot extract PDF text, so "
+                "fetching it (or any other PDF link) is a wasted step. Find an HTML "
+                "page with the same information instead: a docs page, spec page, "
+                "abstract page, or article.]")
     if "html" not in ctype and "xml" not in ctype and resp.text[:100].strip().startswith("{"):
         return resp.text[:FETCH_CHARS]  # looks like JSON/plain
     soup = BeautifulSoup(resp.text, "lxml")
@@ -272,37 +280,89 @@ def stamp_current_question(messages):
     messages[-1]["content"] += date_stamp()
 
 
+DEEP_BRIEF_PREFIX = "\n\n[DEEP RESEARCH MODE"
+
+
+def stamp_deep_brief(messages, min_sources):
+    """Tell the model up front that this run is two ordered stages: COLLECT, then
+    conclude. The depth gate already enforces this after the fact (nudging when it
+    tries to finalize too shallow), but a correction arriving mid-run makes long
+    runs wander — the model half-commits to an answer, gets pushed back out, and
+    re-plans. Stating the shape before step 1 lets it budget the whole run: gather
+    from several angles first, judge once, land once. Same idempotent stamping
+    pattern as the date."""
+    if not messages or messages[-1].get("role") != "user":
+        return
+    if DEEP_BRIEF_PREFIX in messages[-1]["content"]:
+        return
+    messages[-1]["content"] += (
+        f"{DEEP_BRIEF_PREFIX}: before your FIRST tool call, sketch a plan in your "
+        f"reasoning — what must be looked up vs what you will derive yourself, and "
+        f"roughly how many searches/fetches each part needs. Your reasoning persists "
+        f"between steps: check progress against that plan as results arrive, and "
+        f"revise it rather than wander. Then work in two stages, in order. "
+        f"STAGE 1 — COLLECT: search this from several different angles and "
+        f"web_fetch at least {min_sources} DISTINCT websites; read them before "
+        f"judging anything, and do not draw conclusions yet. "
+        f"STAGE 2 — CONCLUDE: only after collecting, weigh the evidence and write "
+        f"the report with citations. If the question also needs derivation "
+        f"(budgets, feasibility), the numbers you fetched are inputs to your own "
+        f"analysis — the analysis itself is yours.]")
+
+
 SYSTEM = """You are a research assistant running locally on the user's machine.
-You can reach the LIVE internet through tools. Your training data is frozen and
-may be outdated, so for anything current, factual, technical, or that you are
-not fully certain about, you MUST use tools rather than guess.
+You can reach the LIVE internet through tools. Your knowledge of the WORLD is
+frozen and may be outdated — for facts out there (current events, versions,
+products, prices, other people's work) use tools rather than guess. Your
+REASONING is not frozen: problems that can be solved by thinking are yours to
+solve, and no tool can do it for you.
 
 TOOLS (call one at a time):
 - web_search    -> {"tool":"web_search","args":{"query":"...","max_results":5}}
 - web_fetch     -> {"tool":"web_fetch","args":{"url":"https://..."}}
 - arxiv_search  -> {"tool":"arxiv_search","args":{"query":"...","max_results":5}}
 
-HOW TO ACT — match your effort to the question:
+HOW TO ACT — first decide where the answer LIVES, then match your effort:
 1. Casual, conversational, or simple questions you already know cold: just
    answer directly. No tools, no multi-step analysis, no ceremony.
-2. Questions needing current or verifiable facts: use tools. To call one, reply
-   with ONLY a single JSON object exactly like the forms above, and nothing
-   else on that turn. No prose around it. IMPORTANT: writing ABOUT a tool call
-   ("I need to search for X", "Use web_search") does NOT call it — only the raw
-   JSON object does. If you decide to search, your entire reply must BE that JSON.
-3. You will then receive an OBSERVATION with the results. Read it.
-4. For a quick lookup, one good source is enough — web_fetch it rather than
+2. DERIVABLE problems — logic puzzles, math, proofs, code tracing, anything
+   self-contained in the question: the answer lives in the problem, not on the
+   web. Solve it in your own reasoning and present the derivation as the
+   answer. Do NOT search for confirmation, similar problems, or something to
+   cite: your proof IS the source, and a derived answer gets no "Sources:"
+   section. Only reach for tools if the problem itself references outside
+   facts you don't have.
+3. HYBRID problems — feasibility studies, designs, sizing/budget questions
+   that mix derivation with real-world data: do the derivation YOURSELF first
+   (set up the budgets and inequalities from the stated constraints), then use
+   tools only to fetch the specific numbers your analysis needs (a motor's
+   mass, a part's torque, a price). Fetched numbers are INPUTS to your math;
+   a product's marketing claim ("lifts 8 kg") is never a substitute for
+   checking the constraints yourself. If a fetched number contradicts your
+   physics, distrust it and say so in the answer.
+4. WORLD questions needing current or verifiable facts: use tools. To call one,
+   reply with ONLY a single JSON object exactly like the forms above, and
+   nothing else on that turn. No prose around it. IMPORTANT: writing ABOUT a
+   tool call ("I need to search for X", "Use web_search") does NOT call it —
+   only the raw JSON object does. If you decide to search, your entire reply
+   must BE that JSON.
+5. You will then receive an OBSERVATION with the results. Read it.
+6. For a quick lookup, one good source is enough — web_fetch it rather than
    trusting a search snippet, then answer.
-5. Save the thorough treatment (several searches from different angles,
+7. Save the thorough treatment (several searches from different angles,
    multiple independent sources, cross-checking) for when the user explicitly
    asks for deep research or the stakes clearly demand it.
-6. Write the FINAL ANSWER as normal prose (NOT JSON). If you used web sources,
+8. Write the FINAL ANSWER as normal prose (NOT JSON). If you used web sources,
    cite them inline as [1], [2], ... and list the full URLs under a "Sources:"
    heading; note any disagreements between sources. Plain text and markdown
    only: write math in plain symbols (169 GB ≈ 47 × 3.58 GB), NEVER LaTeX
    markup (\\[ \\], \\text, \\frac), and never 【 】 citation tokens.
 
 RULES:
+- Multi-step research needs a budget: before the first tool call, note in
+  your reasoning what to find vs what to derive and about how many steps
+  it deserves; each observation tells you which step you are on — check
+  yourself against your plan and converge before the budget runs out.
 - Never invent URLs, facts, numbers, or citations. Only cite pages you actually
   fetched or that appeared in search results.
 - Prefer primary sources (papers, official docs, repos) over blog summaries.
@@ -316,28 +376,49 @@ RULES:
 # the model in two directions at once.
 SYSTEM_NATIVE = """You are a research assistant running locally on the user's machine.
 You can reach the LIVE internet through the tools provided (web_search, web_fetch,
-arxiv_search). Your training data is frozen and may be outdated, so for anything
-current, factual, technical, or that you are not fully certain about, you MUST
-use the tools rather than guess.
+arxiv_search). Your knowledge of the WORLD is frozen and may be outdated — for
+facts out there (current events, versions, products, prices, other people's
+work) use the tools rather than guess. Your REASONING is not frozen: problems
+that can be solved by thinking are yours to solve, and no tool can do it for you.
 
-HOW TO ACT — match your effort to the question:
+HOW TO ACT — first decide where the answer LIVES, then match your effort:
 1. Casual, conversational, or simple questions you already know cold: just
    answer directly. No tools, no multi-step analysis, no ceremony.
-2. Questions needing current or verifiable facts: call the tools. Deciding to
-   search is not searching — actually invoke the tool, don't narrate the plan.
-3. Read each tool result before deciding your next step.
-4. For a quick lookup, one good source is enough — web_fetch it rather than
+2. DERIVABLE problems — logic puzzles, math, proofs, code tracing, anything
+   self-contained in the question: the answer lives in the problem, not on the
+   web. Solve it in your own reasoning and present the derivation as the
+   answer. Do NOT search for confirmation, similar problems, or something to
+   cite: your proof IS the source, and a derived answer gets no "Sources:"
+   section. Only reach for tools if the problem itself references outside
+   facts you don't have.
+3. HYBRID problems — feasibility studies, designs, sizing/budget questions
+   that mix derivation with real-world data: do the derivation YOURSELF first
+   (set up the budgets and inequalities from the stated constraints), then use
+   tools only to fetch the specific numbers your analysis needs (a motor's
+   mass, a part's torque, a price). Fetched numbers are INPUTS to your math;
+   a product's marketing claim ("lifts 8 kg") is never a substitute for
+   checking the constraints yourself. If a fetched number contradicts your
+   physics, distrust it and say so in the answer.
+4. WORLD questions needing current or verifiable facts: call the tools.
+   Deciding to search is not searching — actually invoke the tool, don't
+   narrate the plan.
+5. Read each tool result before deciding your next step.
+6. For a quick lookup, one good source is enough — web_fetch it rather than
    trusting a search snippet, then answer.
-5. Save the thorough treatment (several searches from different angles,
+7. Save the thorough treatment (several searches from different angles,
    multiple independent sources, cross-checking) for when the user explicitly
    asks for deep research or the stakes clearly demand it.
-6. Write the FINAL ANSWER as normal prose. If you used web sources, cite them
+8. Write the FINAL ANSWER as normal prose. If you used web sources, cite them
    inline as [1], [2], ... and list the full URLs under a "Sources:" heading;
    note any disagreements between sources. Plain text and markdown only: write
    math in plain symbols (169 GB ≈ 47 × 3.58 GB), NEVER LaTeX markup
    (\\[ \\], \\text, \\frac), and never 【 】 citation tokens.
 
 RULES:
+- Multi-step research needs a budget: before the first tool call, note in
+  your reasoning what to find vs what to derive and about how many steps
+  it deserves; each observation tells you which step you are on — check
+  yourself against your plan and converge before the budget runs out.
 - Never invent URLs, facts, numbers, or citations. Only cite pages you actually
   fetched or that appeared in search results.
 - Prefer primary sources (papers, official docs, repos) over blog summaries.
@@ -356,8 +437,14 @@ def chat_options():
     not reuse the resident copy: it evicts it and loads a fresh runner (~30s on a 120B).
     Anything that talks to Ollama about a model we may already have loaded (re-arming
     keep_alive, unloading) must send exactly these, or what should be a free timer touch
-    silently costs a full reload."""
-    return {"temperature": 0.4, "num_ctx": NUM_CTX}
+    silently costs a full reload.
+
+    temperature 1.0 / top_p 1.0 is OpenAI's recommended sampling for gpt-oss (top_p set
+    explicitly because Ollama's default is 0.9). A reasoning model does its converging in
+    the analysis channel, not via sampling clamps; the 0.4 used previously produced the
+    classic too-cold signature — near-verbatim repeated thinking across steps and
+    re-searching/re-fetching the same pages in a loop."""
+    return {"temperature": 1.0, "top_p": 1.0, "num_ctx": NUM_CTX}
 
 
 def ollama_chat_stream(model, messages, tools=None, effort=None):
@@ -481,6 +568,18 @@ _TIDY_RULES = [
     (re.compile(r"\\cdot\b"), "·"),
     (re.compile(r"\\(?:le|leq)\b"), "≤"),
     (re.compile(r"\\(?:ge|geq)\b"), "≥"),
+    (re.compile(r"\\(?:ne|neq)\b"), "≠"),
+    # logic symbols — proofs (which the model now writes itself) lean on these
+    (re.compile(r"\\(?:lnot|neg)\b\s*"), "¬"),
+    (re.compile(r"\\(?:land|wedge)\b"), "∧"),
+    (re.compile(r"\\(?:lor|vee)\b"), "∨"),
+    (re.compile(r"\\(?:Rightarrow|implies)\b"), "⇒"),
+    (re.compile(r"\\(?:Leftrightarrow|iff)\b"), "⇔"),
+    (re.compile(r"\\(?:to|rightarrow)\b"), "→"),
+    (re.compile(r"\\(?:begin|end)\{[a-z*]+\}"), ""),       # \begin{aligned} ... \end{aligned}
+    # aligned "&=" keeps its equals; bare & is left alone (R&D, AT&T are prose)
+    (re.compile(r"[ \t]*&=[ \t]*"), " = "),
+    (re.compile(r"\\\\(?=\s*$)", re.M), ""),               # trailing \\ line breaks
     (re.compile(r"\\(?:;|,|:|!)"), " "),                   # LaTeX spacing commands
     (re.compile(r"\\(?:quad|qquad)\b"), "  "),
     (re.compile(r"\\[\[\]()]"), ""),                       # \[ \] \( \) math fences
@@ -601,6 +700,8 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
     if messages and messages[0].get("role") == "system":
         messages[0]["content"] = system_prompt(native)
     stamp_current_question(messages)  # date lands next to the question, where attention is
+    if min_sources > 0:
+        stamp_deep_brief(messages, min_sources)  # deep mode: collect first, conclude once
     read_domains = set()    # distinct sites actually fetched — this is our "depth"
     unread_urls = []        # urls seen in search results but not yet fetched
     nudges = 0
@@ -678,12 +779,16 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
                 return
 
             # --- tools were requested (a native model may batch several per turn) ---
-            for tool, args in calls:
+            for call_idx, (tool, args) in enumerate(calls):
                 label = args.get("query") or args.get("url") or ""
                 yield {"type": "tool_call", "tool": tool, "label": label}
                 t0 = time.time()
                 try:
-                    result = TOOLS[tool](args)   # unknown tool name -> KeyError -> error obs
+                    if tool not in TOOLS:
+                        # a model inventing e.g. web_find gets a steer, not a bare KeyError
+                        raise ValueError(f"unknown tool {tool!r} — the only tools are: "
+                                         + ", ".join(TOOLS))
+                    result = TOOLS[tool](args)
                     obs = format_observation(tool, result)
                     n = len(result) if isinstance(result, list) else 1
                     yield {"type": "observation", "tool": tool, "n": n, "ok": True,
@@ -710,6 +815,21 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
                 except Exception as e:
                     obs = f"ERROR running {tool}: {type(e).__name__}: {e}"
                     yield {"type": "observation", "tool": tool, "n": 0, "ok": False, "preview": obs}
+
+                # Budget clock, on the last observation of the step. The model can only
+                # pace a run it can see: without this it learns it was on step 12 of 12
+                # by being force-synthesized, and the landing comes out half-baked. It
+                # rides INSIDE the tool/observation content on purpose — a user-role
+                # note here would move the template's "last user message" marker and
+                # amputate the retained reasoning (the plan) on every step.
+                if call_idx == len(calls) - 1:
+                    left = MAX_STEPS - step
+                    clock = f"\n\n[progress: research step {step} of {MAX_STEPS}"
+                    if left <= 3:
+                        clock += (f" — only {left} step(s) remain before the final answer "
+                                  "is forced. Stop opening new leads; converge and land "
+                                  "the answer yourself")
+                    obs += clock + "]"
 
                 # Feed the result back in whichever protocol the call arrived by. A
                 # natively-called turn gets a real `tool` message (the template
