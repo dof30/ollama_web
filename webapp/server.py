@@ -85,6 +85,30 @@ _session_lock = threading.Lock()
 # selector leaves it off so effort stays proportional to the question.
 EFFORT_SOURCES = {"high": 0, "medium": 0, "low": 0}
 
+# A browser tab outlives this process: it keeps the conversation in localStorage, so
+# after a restart it asks with a sid we have never seen. Rebuild the session from the
+# tab's own copy — otherwise the page shows a conversation the model has no memory of,
+# and the next follow-up gets answered out of thin air. Bounded on every axis so a
+# crafted payload can't quietly fill the context window.
+RESTORE_TURNS = 8
+RESTORE_CHARS = 4000
+
+
+def seed_session(restore):
+    """A fresh conversation, optionally pre-loaded with a tab's remembered turns."""
+    messages = engine.new_conversation()
+    if not isinstance(restore, list):
+        return messages
+    for turn in restore[-RESTORE_TURNS:]:
+        if not isinstance(turn, dict):
+            continue
+        q = str(turn.get("q") or "")[:RESTORE_CHARS]
+        a = str(turn.get("a") or "")[:RESTORE_CHARS]
+        if q and a:  # only complete pairs; a dangling question teaches it nothing
+            messages.append({"role": "user", "content": q})
+            messages.append({"role": "assistant", "content": a})
+    return messages
+
 
 def list_models():
     try:
@@ -95,7 +119,7 @@ def list_models():
         return []
 
 
-def set_keep_alive(name, keep_alive):
+def set_keep_alive(name, keep_alive, timeout=120):
     """Set how long `name` stays resident, without disturbing a running copy.
 
     Mirrors agent.ollama_chat_stream's request exactly — same endpoint, same options —
@@ -108,7 +132,7 @@ def set_keep_alive(name, keep_alive):
     req = urllib.request.Request(OLLAMA_HOST + "/api/chat",
                                  data=json.dumps(payload).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
 
@@ -117,6 +141,24 @@ def unload_model(name):
     it won't generate. (NOT -1 — that pins RAM forever, and once wedged a model with a
     year-2318 expiry.)"""
     return set_keep_alive(name, 0)
+
+
+def switch_model(old, new):
+    """Hand RAM from one model to the next: drop `old`, then pull `new` in.
+
+    Order matters on a box where two 100B-class models don't fit at once — freeing
+    first means the load isn't racing the old model for memory. `old` is only touched
+    if it is actually resident, since the empty-prompt request that unloads a model
+    would otherwise *load* one that wasn't there just to expire it. Loading is the
+    same empty-message call, so the new model arrives warm without generating a token.
+    The long timeout is the point of the whole feature: a 120B cold load is ~30s, and
+    a bigger one can take minutes."""
+    unloaded = None
+    if old and old != new and old in loaded_models():
+        unload_model(old)
+        unloaded = old
+    set_keep_alive(new, agent.keep_alive_for(new) or IDLE_KEEP_ALIVE, timeout=600)
+    return {"ok": True, "unloaded": unloaded, "loaded": new}
 
 
 # ---------- tab presence -> how long the workhorse stays warm ----------
@@ -276,6 +318,22 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(502, json.dumps({"error": f"{type(e).__name__}: {e}"}))
             return
+        if self.path == "/api/switch":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                req = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._send(400, json.dumps({"error": "bad json"}))
+                return
+            new = (req.get("to") or "").strip()
+            if not new:
+                self._send(400, json.dumps({"error": "no model"}))
+                return
+            try:
+                self._send(200, json.dumps(switch_model((req.get("from") or "").strip(), new)))
+            except Exception as e:
+                self._send(502, json.dumps({"error": f"{type(e).__name__}: {e}"}))
+            return
         if self.path != "/api/ask":
             self._send(404, json.dumps({"error": "not found"}))
             return
@@ -301,12 +359,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"error": "empty question"}))
             return
 
-        messages = SESSIONS.setdefault(sid, engine.new_conversation())
         # Claim the session, then work on a private copy. A stopped turn's thread keeps
         # running until its next write fails, so it can still be alive when the next
         # question arrives; the copy keeps the two loops from corrupting each other's
         # context, and turn_id stops the older one writing back over the newer answer.
         with _session_lock:
+            messages = SESSIONS.get(sid)
+            if messages is None:   # unknown sid: a tab from before the last restart
+                messages = SESSIONS[sid] = seed_session(req.get("restore"))
             turn_id = TURNS[sid] = TURNS.get(sid, 0) + 1
         work = engine.start_turn(messages, question)
 

@@ -151,6 +151,16 @@
   #send.stopping::before{content:"";width:13px;height:13px;
                          border:2px solid currentColor;border-radius:3px}
   .hint{color:var(--dim);font-size:12px;margin-top:6px;text-align:center}
+  /* confirm sheet — used when switching models trades one model's RAM for another's */
+  .modal{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;
+         background:rgba(0,0,0,.45);padding:20px}
+  .modal[hidden]{display:none}
+  .sheet{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+         padding:18px 20px;max-width:460px;width:100%;box-shadow:0 14px 44px rgba(0,0,0,.4)}
+  .sheet h3{margin:0 0 10px;font-size:16px}
+  .sheet p{margin:0 0 8px;color:var(--dim);font-size:14px;line-height:1.55}
+  .sheet .name{color:var(--ink);font-weight:600;word-break:break-all}
+  .modalbar{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
   #jump{position:fixed;right:22px;bottom:104px;z-index:5;display:none;cursor:pointer;
         background:var(--accent);color:var(--accent-ink);border:none;border-radius:18px;
         padding:7px 14px;font-size:13px;box-shadow:0 2px 10px rgba(0,0,0,.28)}
@@ -169,6 +179,17 @@
 
   <div id="convo"><div class="wrap" id="turns"></div></div>
   <button id="jump" title="Jump to latest">↓ latest</button>
+
+  <div id="modal" class="modal" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="modaltitle">
+      <h3 id="modaltitle">Switch model?</h3>
+      <div id="modaltext"></div>
+      <div class="modalbar">
+        <button id="modalcancel">Cancel</button>
+        <button id="modalok" class="primary">OK</button>
+      </div>
+    </div>
+  </div>
 
   <footer><div class="wrap">
     <div class="composer">
@@ -199,8 +220,34 @@
 <script>
 const $ = s => document.querySelector(s);
 const turns = $("#turns"), convo = $("#convo"), jump = $("#jump");
-let sid = crypto.randomUUID();
 let controller = null, liveQuestion = null;
+
+// ---- the conversation, kept in localStorage ----
+// Without this the TAB is the conversation: sid was regenerated on every page load,
+// so a reload — or pasting the URL into a second tab — opened a blank page while the
+// real session sat unreachable in the server's memory. Keeping sid + finished turns
+// here lets any tab pick the thread back up. Deliberately client-side: a new tab has
+// to learn the sid from somewhere anyway, and a server "read my history" route would
+// be a second way to pull conversations back out over HTTP, which history.py's whole
+// posture is built to avoid.
+const SKEY = "research.session";
+const KEEP_TURNS = 8;          // mirrors the server's RESEARCH_MAX_HISTORY_TURNS
+function loadStore(){
+  try{
+    const s = JSON.parse(localStorage.getItem(SKEY));
+    if(s && typeof s.sid === "string" && Array.isArray(s.turns)) return s;
+  }catch(e){}                  // unparseable/absent: start fresh rather than break
+  return null;
+}
+function saveStore(){ try{ localStorage.setItem(SKEY, JSON.stringify(store)); }catch(e){} }
+let store = loadStore() || {sid: crypto.randomUUID(), turns: []};
+let sid = store.sid;
+saveStore();
+function rememberTurn(q, a){
+  store.turns.push({q, a});
+  if(store.turns.length > KEEP_TURNS) store.turns = store.turns.slice(-KEEP_TURNS);
+  saveStore();
+}
 
 // ---- minimal, dependency-free markdown -> safe HTML ----
 // Quotes must be escaped too: inline() builds href="..." attributes out of this
@@ -244,6 +291,7 @@ function markdown(text){
 }
 
 // ---- models ----
+let currentModel = null;   // what is actually loaded/selected, so a cancelled switch can revert
 async function loadModels(){
   try{
     const r = await fetch("/api/models"); const d = await r.json();
@@ -253,6 +301,7 @@ async function loadModels(){
       if(name===d.default) o.selected=true; sel.appendChild(o);
     });
     if(!d.models || !d.models.length){ const o=document.createElement("option"); o.textContent="(no models)"; sel.appendChild(o); }
+    currentModel = sel.value;   // the baseline a switch is measured against
   }catch(e){ /* offline is fine; server will error clearly on send */ }
 }
 
@@ -276,6 +325,29 @@ function scrollDown(){ if(stick){ convo.scrollTop = convo.scrollHeight; lastTop 
 function stickToBottom(){ stick = true; convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop; jump.classList.remove("show"); }
 jump.onclick = stickToBottom;
 
+function addCopyBar(ansEl, text){
+  const bar=document.createElement("div"); bar.className="answerbar";
+  const b=document.createElement("button"); b.textContent="Copy";
+  b.onclick=()=>{ navigator.clipboard.writeText(text); b.textContent="Copied ✓";
+                  setTimeout(()=>b.textContent="Copy",1200); };
+  bar.appendChild(b); ansEl.appendChild(bar);
+}
+
+// A turn replayed from localStorage: question + answer, no trace. The reasoning
+// steps are deliberately not stored — the server discards that bulk after each turn
+// too (commit_turn), so what the page shows matches what the model still remembers.
+function renderSaved(q, a){
+  const t=document.createElement("div"); t.className="turn";
+  const u=document.createElement("div"); u.className="user"; u.textContent=q;
+  const ed=document.createElement("button"); ed.className="edit"; ed.textContent="✎ edit";
+  ed.title="Put this question back in the box to reword and ask again";
+  ed.onclick=()=>reAsk(q);
+  u.appendChild(ed);
+  const ans=document.createElement("div"); ans.className="answer";
+  ans.innerHTML=markdown(a); addCopyBar(ans, a);
+  t.appendChild(u); t.appendChild(ans); turns.appendChild(t);
+}
+
 // ---- one Q/A turn ----
 function newTurn(question){
   const t = document.createElement("div"); t.className="turn";
@@ -294,7 +366,7 @@ function newTurn(question){
   turns.appendChild(t); scrollDown();
   return {t, trace, sum, body, ans, stream,
           stepEl:null, thinkEl:null, srcEl:null, stepBuf:"", loadTimer:null,
-          answering:false, ansLive:null};
+          answering:false, ansLive:null, lastStep:null};
 }
 
 function setStatus(ctx, label){   // live one-line status shown while the model works
@@ -333,7 +405,10 @@ async function ask(question){
   try{
     const resp = await fetch("/api/ask",{
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({q:question, model, effort, sid}),
+      // `restore` lets the server rebuild this session if it has never heard of the
+      // sid — after a server restart the tab still shows the conversation, so the
+      // model must get it back too or the next follow-up answers out of nowhere.
+      body: JSON.stringify({q:question, model, effort, sid, restore: store.turns}),
       signal: controller.signal,
     });
     const reader = resp.body.getReader(); const dec = new TextDecoder();
@@ -354,6 +429,7 @@ async function ask(question){
     if(e.name!=="AbortError"){ ctx.stream.textContent = "connection error: "+e.message; }
   }finally{
     clearLoad(ctx);
+    if(finalText) rememberTurn(question, finalText);   // survive reload / other tabs
     sendMode("send"); runEnded=performance.now();
     controller=null; $("#q").focus();
   }
@@ -370,7 +446,13 @@ function handle(ctx, ev){
       // Park that draft in the trace (don't delete it) before opening the new step.
       parkDraft(ctx);
       const s=document.createElement("div"); s.className="step";
-      s.innerHTML=`<span class="steplabel">step ${ev.n}</span>`;
+      // A step whose every tool call failed (dead link, PDF, consent wall) is refunded
+      // server-side, so the same number comes round again — label it a retry rather
+      // than showing two blocks that both claim to be "step 3".
+      const retry = ctx.lastStep!=null && ev.n<=ctx.lastStep;
+      ctx.lastStep = ev.n;
+      s.innerHTML=`<span class="steplabel">step ${ev.n}${ev.max?" of "+ev.max:""}`
+                + `${retry?' · retry (last source gave nothing)':''}</span>`;
       const th=document.createElement("div"); th.className="think"; s.appendChild(th);
       ctx.body.appendChild(s); ctx.stepEl=s; ctx.thinkEl=th; ctx.stepBuf="";
       ctx.answering=false;
@@ -432,11 +514,7 @@ function handle(ctx, ev){
     }
     case "final":{
       ctx.ans.innerHTML = markdown(ev.text);
-      const bar=document.createElement("div"); bar.className="answerbar";
-      const b=document.createElement("button"); b.textContent="Copy";
-      b.onclick=()=>{ navigator.clipboard.writeText(ev.text); b.textContent="Copied ✓";
-                      setTimeout(()=>b.textContent="Copy",1200); };
-      bar.appendChild(b); ctx.ans.appendChild(bar);
+      addCopyBar(ctx.ans, ev.text);
       setDone(ctx,true); return ev.text;
     }
     case "error":
@@ -452,6 +530,59 @@ function flashHint(msg){
   hintEl.textContent=msg;
   clearTimeout(hintTimer); hintTimer=setTimeout(()=>hintEl.textContent=hintDefault, 2000);
 }
+// Same line, but it stays put — for work that outlasts flashHint's 2s (a cold model
+// load runs ~30s and longer for the big ones). Ended by the next flashHint.
+function holdHint(msg){ clearTimeout(hintTimer); hintEl.textContent=msg; }
+
+// ---- confirm sheet ----
+// Resolves true on OK, false on Cancel / Esc / clicking the backdrop.
+const modal=$("#modal"); let modalDone=null;
+function confirmSheet(title, bodyHTML){
+  $("#modaltitle").textContent=title; $("#modaltext").innerHTML=bodyHTML;
+  modal.hidden=false; $("#modalok").focus();
+  return new Promise(res => modalDone = res);
+}
+function closeSheet(v){ modal.hidden=true; const f=modalDone; modalDone=null; if(f) f(v); }
+$("#modalcancel").onclick=()=>closeSheet(false);
+$("#modalok").onclick=()=>closeSheet(true);
+modal.addEventListener("click", e=>{ if(e.target===modal) closeSheet(false); });   // backdrop
+addEventListener("keydown", e=>{
+  if(modal.hidden) return;
+  if(e.key==="Escape"){ e.preventDefault(); closeSheet(false); }
+  if(e.key==="Enter"){ e.preventDefault(); closeSheet(true); }
+});
+
+// ---- switching models trades one model's RAM for another's ----
+// On this machine two 100B-class models don't fit at once, so picking a different one
+// is not a free menu choice: the old one is dropped and the new one is pulled in (~30s
+// cold, longer for the big ones). That's worth a confirm rather than a surprise.
+$("#model").addEventListener("change", async () => {
+  const sel=$("#model"), next=sel.value, prev=currentModel;
+  if(!prev || next===prev) { currentModel = next; return; }
+  if(controller){          // mid-answer: the running turn is using the current model
+    sel.value = prev;
+    flashHint("⏳ can't switch models while an answer is streaming");
+    return;
+  }
+  const ok = await confirmSheet("Switch model?",
+    `<p>This deactivates <span class="name">${esc(prev)}</span>, freeing its RAM, ` +
+    `then activates <span class="name">${esc(next)}</span>.</p>` +
+    `<p>Loading the new model takes ~30s (longer for the largest ones). ` +
+    `Your conversation is kept.</p>`);
+  if(!ok){ sel.value = prev; return; }
+  sel.disabled=true;
+  holdHint("⟳ switching to "+next+" — loading into memory…");
+  try{
+    const r = await fetch("/api/switch",{method:"POST",headers:{"Content-Type":"application/json"},
+                                         body:JSON.stringify({from:prev, to:next})});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    currentModel = next;
+    flashHint("✓ "+next+" is loaded and ready");
+  }catch(e){
+    sel.value = prev;    // the switch failed; the selector must not lie about what's live
+    flashHint("⚠ switch failed — staying on "+prev);
+  }finally{ sel.disabled=false; }
+});
 // Shell-style command history: Up/Down cycle through prior questions.
 const history=[]; let hIdx=0, draft="";
 function send(){
@@ -515,7 +646,8 @@ $("#newchat").onclick=()=>{
   // Abort any run in flight: otherwise it keeps generating into the (now cleared)
   // page and holds Send locked until it finishes on its own.
   if(controller) controller.abort();
-  sid=crypto.randomUUID(); turns.innerHTML=""; $("#q").focus(); };
+  store={sid:crypto.randomUUID(), turns:[]}; sid=store.sid; saveStore();
+  turns.innerHTML=""; $("#q").focus(); };
 $("#sayhi").onclick=()=>{ if(controller) return; stick=true; ask("Hi"); };  // warm the model without typing
 $("#deactivate").onclick=async()=>{                       // unload the model from RAM on demand
   const m=$("#model").value;
@@ -582,6 +714,28 @@ document.querySelectorAll(".cup").forEach(b => b.onclick = () => {
 });
 autosize($("#q"));   // settle the box at exactly its resting height, so the first
                      // keystroke can't nudge it by a pixel
+
+// Replay the stored conversation, then keep tabs on the same session in step: the
+// `storage` event fires in every OTHER tab when one of them writes, so an answer
+// finished in one tab shows up in the others. Skipped while this tab is mid-run —
+// its own turn is still streaming into the page and would be interleaved.
+store.turns.forEach(t => renderSaved(t.q, t.a));
+stickToBottom();
+addEventListener("storage", e => {
+  if(e.key !== SKEY) return;
+  const s = loadStore(); if(!s) return;
+  if(s.sid !== sid){                       // another tab pressed New chat
+    store = s; sid = s.sid;
+    if(controller) controller.abort();
+    turns.innerHTML = ""; s.turns.forEach(t => renderSaved(t.q, t.a));
+  }else if(!controller && s.turns.length > store.turns.length){
+    s.turns.slice(store.turns.length).forEach(t => renderSaved(t.q, t.a));
+    store = s;
+  }else{
+    store = s;                             // keep the data, don't touch the view
+  }
+  stickToBottom();
+});
 
 loadModels(); $("#q").focus();
 </script>
