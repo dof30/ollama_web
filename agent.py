@@ -42,6 +42,21 @@ MAX_STEPS     = int(os.environ.get("RESEARCH_MAX_STEPS", "12"))
 FETCH_CHARS   = int(os.environ.get("RESEARCH_FETCH_CHARS", "6000"))
 MIN_SOURCES   = int(os.environ.get("RESEARCH_MIN_SOURCES", "0"))  # 0 = no gate, model decides; --deep/--depth to force
 MAX_NUDGES    = int(os.environ.get("RESEARCH_MAX_NUDGES", "4"))   # times we push it to go deeper
+# High reasoning effort explores more per run, so it needs a bigger budget than the 12
+# that was tuned for medium. Measured on one research question, effort isolated:
+# medium finished in 8 steps / 7 tool calls, high took 10 steps / 9 tool calls (+25%)
+# and additionally burned a step on an invented tool. Given the same ~1.5x headroom
+# over its measured need that medium enjoys, high wants ~16. Context is NOT the limit
+# here — that run peaked at 43% of num_ctx, so the extra steps have room to breathe.
+MAX_STEPS_HIGH = int(os.environ.get("RESEARCH_MAX_STEPS_HIGH", "16"))
+# How many refunded (all-tools-failed) steps a single run may take before we stop
+# refunding. Bounds the loop: iterations <= max_steps + MAX_WASTED_STEPS + 1.
+MAX_WASTED_STEPS = int(os.environ.get("RESEARCH_MAX_WASTED_STEPS", "4"))
+
+
+def steps_for(effort):
+    """Research budget for this reasoning effort. Only `high` differs: see above."""
+    return MAX_STEPS_HIGH if effort == "high" else MAX_STEPS
 # A stock browser UA, deliberately: a custom "research-agent" token would label
 # every fetch as a bot to sites and network observers — worse for privacy AND
 # more likely to be blocked. Blend in with the browser traffic this machine
@@ -89,6 +104,13 @@ def c(text, color):
 # TOOLS  — the real capability the model gains
 # ========================================================================
 
+class UnusableSource(Exception):
+    """The tool ran without crashing but returned nothing a text model can work with —
+    a PDF, a page with no readable body, a search with no hits. Raised rather than
+    returned so it joins the same path as a 403 or a timeout: the research loop treats
+    every one of these as a step that cost the user nothing and gives the step back."""
+
+
 def web_search(query, max_results=5):
     """Search the web via DuckDuckGo. Returns a list of {title, url, snippet}."""
     from ddgs import DDGS
@@ -113,10 +135,10 @@ def web_fetch(url):
         # Without this, a PDF arrives as compressed-binary soup: the model burns a
         # step reading garbage, concludes "maybe another PDF will extract better",
         # and burns the next step the same way (watched it happen twice in a row).
-        return (f"URL: {url}\n[This is a PDF — web_fetch cannot extract PDF text, so "
-                "fetching it (or any other PDF link) is a wasted step. Find an HTML "
-                "page with the same information instead: a docs page, spec page, "
-                "abstract page, or article.]")
+        raise UnusableSource(
+            f"{url} is a PDF — web_fetch cannot extract PDF text, so fetching it (or "
+            "any other PDF link) will not work. Find an HTML page with the same "
+            "information instead: a docs page, spec page, abstract page, or article.")
     if "html" not in ctype and "xml" not in ctype and resp.text[:100].strip().startswith("{"):
         return resp.text[:FETCH_CHARS]  # looks like JSON/plain
     soup = BeautifulSoup(resp.text, "lxml")
@@ -125,6 +147,14 @@ def web_fetch(url):
     title = (soup.title.string.strip() if soup.title and soup.title.string else "")
     text = re.sub(r"\n\s*\n+", "\n\n", soup.get_text("\n"))
     text = re.sub(r"[ \t]+", " ", text).strip()
+    if len(text) < 80:
+        # A JS-only app or consent wall extracts to essentially nothing. The bar is
+        # deliberately low: a short page can still be a real source (example.com is
+        # 142 chars), and wrongly discarding a good fetch costs more than reading a
+        # thin one.
+        raise UnusableSource(
+            f"{url} returned almost no readable text ({len(text)} chars) — it is likely "
+            "JavaScript-rendered or behind a consent wall. Try a different source.")
     body = text[:FETCH_CHARS]
     if len(text) > FETCH_CHARS:
         body += "\n...[truncated]..."
@@ -708,9 +738,13 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
     stalls = 0              # turns that returned only reasoning — no answer, no call
     searches_in_a_row = 0   # list-tool calls since the last web_fetch (loop detector)
 
+    max_steps = steps_for(effort)
+    step = 0
+    wasted = 0              # steps refunded because every tool call in them failed
     try:
-        for step in range(1, MAX_STEPS + 1):
-            yield {"type": "step", "n": step}
+        while step < max_steps and wasted <= MAX_WASTED_STEPS:
+            step += 1
+            yield {"type": "step", "n": step, "max": max_steps}
 
             content = thinking = ""
             calls = []
@@ -779,6 +813,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
                 return
 
             # --- tools were requested (a native model may batch several per turn) ---
+            step_usable = False   # did anything in this step actually come back readable?
             for call_idx, (tool, args) in enumerate(calls):
                 label = args.get("query") or args.get("url") or ""
                 yield {"type": "tool_call", "tool": tool, "label": label}
@@ -789,8 +824,13 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
                         raise ValueError(f"unknown tool {tool!r} — the only tools are: "
                                          + ", ".join(TOOLS))
                     result = TOOLS[tool](args)
+                    if isinstance(result, list) and not result:
+                        raise UnusableSource(
+                            f"{tool} found no results for that query — it is too narrow "
+                            "or misspelled. Rephrase it with different keywords.")
                     obs = format_observation(tool, result)
                     n = len(result) if isinstance(result, list) else 1
+                    step_usable = True
                     yield {"type": "observation", "tool": tool, "n": n, "ok": True,
                            "preview": f"{n} result(s) in {time.time() - t0:.1f}s"}
                     if tool == "web_fetch":  # count it as a real source read
@@ -812,24 +852,13 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
                                     "surface anything new. Either web_fetch ONE of the URLs "
                                     "above, or — if you already know enough — write the FINAL "
                                     "ANSWER now.")
+                except UnusableSource as e:
+                    obs = str(e)          # already a plain steer; no traceback dressing
+                    yield {"type": "observation", "tool": tool, "n": 0, "ok": False,
+                           "preview": f"unusable: {str(e)[:80]}"}
                 except Exception as e:
                     obs = f"ERROR running {tool}: {type(e).__name__}: {e}"
                     yield {"type": "observation", "tool": tool, "n": 0, "ok": False, "preview": obs}
-
-                # Budget clock, on the last observation of the step. The model can only
-                # pace a run it can see: without this it learns it was on step 12 of 12
-                # by being force-synthesized, and the landing comes out half-baked. It
-                # rides INSIDE the tool/observation content on purpose — a user-role
-                # note here would move the template's "last user message" marker and
-                # amputate the retained reasoning (the plan) on every step.
-                if call_idx == len(calls) - 1:
-                    left = MAX_STEPS - step
-                    clock = f"\n\n[progress: research step {step} of {MAX_STEPS}"
-                    if left <= 3:
-                        clock += (f" — only {left} step(s) remain before the final answer "
-                                  "is forced. Stop opening new leads; converge and land "
-                                  "the answer yourself")
-                    obs += clock + "]"
 
                 # Feed the result back in whichever protocol the call arrived by. A
                 # natively-called turn gets a real `tool` message (the template
@@ -841,6 +870,35 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
                     messages.append({"role": "user", "content":
                                      f"OBSERVATION from {tool}:\n{obs}\n\n"
                                      f"Continue: call another tool (JSON only) or write the FINAL ANSWER."})
+
+            # --- refund a step that yielded nothing, then post the budget clock ---
+            # A 403, a PDF, a consent wall or an empty search costs the user real time
+            # but teaches the model nothing, so charging a step for it shortens the
+            # research for no reason. Give the step back and let it try another source.
+            # `wasted` is capped so a model stuck on broken links still terminates:
+            # the run can never exceed max_steps + MAX_WASTED_STEPS + 1 iterations.
+            refunded = bool(calls) and not step_usable
+            if refunded:
+                wasted += 1
+                step -= 1
+            if calls:
+                # Clock goes on the LAST message of the step, after the whole step's
+                # outcome is known. It rides inside the tool/observation content on
+                # purpose: a user-role note would move the chat template's
+                # "last user message" marker and amputate the retained reasoning.
+                if refunded:
+                    clock = (f"\n\n[that source gave nothing usable, so step {step + 1} was "
+                             f"NOT charged — you still have {max_steps - step} of "
+                             f"{max_steps} research steps. Try a different source.]")
+                else:
+                    left = max_steps - step
+                    clock = f"\n\n[progress: research step {step} of {max_steps}"
+                    if left <= 3:
+                        clock += (f" — only {left} step(s) remain before the final answer "
+                                  "is forced. Stop opening new leads; converge and land "
+                                  "the answer yourself")
+                    clock += "]"
+                messages[-1]["content"] += clock
 
             # Once we've pushed it enough, stop looping and make it write the report.
             if nudges >= MAX_NUDGES and len(read_domains) >= 1:
@@ -875,7 +933,8 @@ def run_agent(model, messages, min_sources=MIN_SOURCES):
         if t == "step":
             newline()
             gate = f", read {read}/{min_sources}" if min_sources > 0 else ""
-            sys.stdout.write(c(f"\n  ┄ thinking (step {ev['n']}/{MAX_STEPS}{gate}) ┄\n", C.dim))
+            sys.stdout.write(c(f"\n  ┄ thinking (step {ev['n']}/{ev.get('max', MAX_STEPS)}"
+                               f"{gate}) ┄\n", C.dim))
             at_line_start = True
         elif t in ("thinking", "answer_chunk"):
             sys.stdout.write(c(ev["text"], C.dim))
