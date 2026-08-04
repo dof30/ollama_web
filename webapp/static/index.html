@@ -161,10 +161,6 @@
   .sheet p{margin:0 0 8px;color:var(--dim);font-size:14px;line-height:1.55}
   .sheet .name{color:var(--ink);font-weight:600;word-break:break-all}
   .modalbar{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
-  #jump{position:fixed;right:22px;bottom:104px;z-index:5;display:none;cursor:pointer;
-        background:var(--accent);color:var(--accent-ink);border:none;border-radius:18px;
-        padding:7px 14px;font-size:13px;box-shadow:0 2px 10px rgba(0,0,0,.28)}
-  #jump.show{display:block}
 </style>
 </head>
 <body>
@@ -178,7 +174,6 @@
   </header>
 
   <div id="convo"><div class="wrap" id="turns"></div></div>
-  <button id="jump" title="Jump to latest">↓ latest</button>
 
   <div id="modal" class="modal" hidden>
     <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="modaltitle">
@@ -219,7 +214,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
-const turns = $("#turns"), convo = $("#convo"), jump = $("#jump");
+const turns = $("#turns"), convo = $("#convo");
 let controller = null, liveQuestion = null;
 
 // ---- the conversation, kept in localStorage ----
@@ -305,9 +300,9 @@ async function loadModels(){
   }catch(e){ /* offline is fine; server will error clearly on send */ }
 }
 
-// Follow the stream only while the user is parked at the bottom. As soon as they
-// scroll up to read something mid-generation, stop yanking the view down; a "↓ latest"
-// button appears, and scrolling back to the bottom (or clicking it) resumes following.
+// Follow the stream only while the user is parked at the bottom. As soon as they scroll
+// up to read something mid-generation, stop yanking the view down; scrolling back to the
+// bottom resumes following.
 let stick = true, lastTop = 0;
 convo.addEventListener("scroll", () => {
   const top = convo.scrollTop;
@@ -319,11 +314,9 @@ convo.addEventListener("scroll", () => {
   if(top < lastTop - 2) stick = false;
   else if(atBottom) stick = true;
   lastTop = top;
-  jump.classList.toggle("show", !stick);
 });
 function scrollDown(){ if(stick){ convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop; } }
-function stickToBottom(){ stick = true; convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop; jump.classList.remove("show"); }
-jump.onclick = stickToBottom;
+function stickToBottom(){ stick = true; convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop; }
 
 function addCopyBar(ansEl, text){
   const bar=document.createElement("div"); bar.className="answerbar";
