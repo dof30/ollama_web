@@ -42,6 +42,14 @@ MAX_STEPS     = int(os.environ.get("RESEARCH_MAX_STEPS", "12"))
 FETCH_CHARS   = int(os.environ.get("RESEARCH_FETCH_CHARS", "6000"))
 MIN_SOURCES   = int(os.environ.get("RESEARCH_MIN_SOURCES", "0"))  # 0 = no gate, model decides; --deep/--depth to force
 MAX_NUDGES    = int(os.environ.get("RESEARCH_MAX_NUDGES", "4"))   # times we push it to go deeper
+# Default sampling temperature. 1.0 is OpenAI's recommendation for gpt-oss — see
+# chat_options() for why lower is counterproductive on a reasoning model. The UI can
+# override it per request; this stays the value everything falls back to.
+TEMPERATURE   = float(os.environ.get("RESEARCH_TEMPERATURE", "1.0"))
+# The band the dial may move in: under ~0.4 a reasoning model repeats its own thinking
+# verbatim, over 1.0 it wanders. Both ends are clamps, not suggestions.
+TEMP_MIN      = float(os.environ.get("RESEARCH_TEMP_MIN", "0.4"))
+TEMP_MAX      = float(os.environ.get("RESEARCH_TEMP_MAX", "1.0"))
 # High reasoning effort explores more per run, so it needs a bigger budget than the 12
 # that was tuned for medium. Measured on one research question, effort isolated:
 # medium finished in 8 steps / 7 tool calls, high took 10 steps / 9 tool calls (+25%)
@@ -460,7 +468,7 @@ RULES:
 # OLLAMA (streaming, via stdlib — no extra dependency)
 # ========================================================================
 
-def chat_options():
+def chat_options(temperature=None):
     """Runner options sent with EVERY request — and the single source of truth for them.
 
     Ollama keys a loaded model on its options, so a request carrying different ones does
@@ -473,16 +481,22 @@ def chat_options():
     explicitly because Ollama's default is 0.9). A reasoning model does its converging in
     the analysis channel, not via sampling clamps; the 0.4 used previously produced the
     classic too-cold signature — near-verbatim repeated thinking across steps and
-    re-searching/re-fetching the same pages in a loop."""
-    return {"temperature": 1.0, "top_p": 1.0, "num_ctx": NUM_CTX}
+    re-searching/re-fetching the same pages in a loop.
+
+    `temperature` overrides that default for one request. Unlike num_ctx it is a
+    per-request SAMPLING knob, not a runner setting: measured against a resident
+    120B, load_duration stayed at 0.2s across 0.2/1.0/1.8, i.e. changing it does not
+    evict or reload the model. That is why the UI can expose it as a live dial."""
+    return {"temperature": TEMPERATURE if temperature is None else temperature,
+            "top_p": 1.0, "num_ctx": NUM_CTX}
 
 
-def ollama_chat_stream(model, messages, tools=None, effort=None):
+def ollama_chat_stream(model, messages, tools=None, effort=None, temperature=None):
     payload = {
         "model": model,
         "messages": messages,
         "stream": True,
-        "options": chat_options(),
+        "options": chat_options(temperature),
     }
     ka = keep_alive_for(model)
     if ka is not None:          # else defer to the server's global OLLAMA_KEEP_ALIVE
@@ -626,7 +640,7 @@ def tidy_answer(text):
 # AGENT LOOP
 # ========================================================================
 
-def _stream_turn(model, messages, tools=None, effort=None):
+def _stream_turn(model, messages, tools=None, effort=None, temperature=None):
     """Stream one model completion, yielding {"type":"answer_chunk"|"thinking"} as
     tokens arrive, then a final {"_turn": (content, thinking, native_calls)}
     sentinel, where native_calls is a list of (tool, args) that arrived through
@@ -635,7 +649,7 @@ def _stream_turn(model, messages, tools=None, effort=None):
     hide the answer or the tool call in either, so we surface both and let the
     caller decide. This is the one streaming primitive behind both the CLI and web."""
     content, thinking, native_calls = "", "", []
-    for kind, chunk in ollama_chat_stream(model, messages, tools, effort):
+    for kind, chunk in ollama_chat_stream(model, messages, tools, effort, temperature):
         if kind == "content":
             content += chunk
             yield {"type": "answer_chunk", "text": chunk}
@@ -677,13 +691,13 @@ SYNTH_FROM_KNOWLEDGE = (
     "you need to search. Answer the question directly from your own knowledge, as "
     "prose. If you are not fully certain, say so in one short line at the end.")
 
-def _synthesis(model, messages, instruction=SYNTH_FROM_EVIDENCE, effort=None):
+def _synthesis(model, messages, instruction=SYNTH_FROM_EVIDENCE, effort=None, temperature=None):
     """Force a written answer: stream it as answer chunks, then end with a `final`
     event carrying the whole text. No `tools` are passed here, so in native mode
     the model cannot call anything even if it wants to — prose is the only exit."""
     messages.append({"role": "user", "content": instruction})
     content = thinking = ""
-    for ev in _stream_turn(model, messages, effort=effort):
+    for ev in _stream_turn(model, messages, effort=effort, temperature=temperature):
         if "_turn" in ev:
             content, thinking, _ = ev["_turn"]
         else:
@@ -706,7 +720,7 @@ def effort_for(min_sources):
     return "low" if min_sources < 3 else "high"   # Quick (1 source) / Deep (5 sources)
 
 
-def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
+def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, temperature=None):
     """The research loop as a STREAM OF EVENTS — the single source of truth behind
     both the terminal renderer (run_agent) and the web UI (webapp/engine.py). It
     drives the ReAct tool loop, mutating `messages` in place so follow-ups keep
@@ -748,7 +762,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
 
             content = thinking = ""
             calls = []
-            for ev in _stream_turn(model, messages, tools, effort):
+            for ev in _stream_turn(model, messages, tools, effort, temperature):
                 if "_turn" in ev:
                     content, thinking, calls = ev["_turn"]
                 else:
@@ -807,7 +821,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
                 # Nudges exhausted: if it researched, synthesize from that; else answer
                 # from its own knowledge (never surface raw "I need to search" reasoning).
                 instr = SYNTH_FROM_EVIDENCE if read_domains else SYNTH_FROM_KNOWLEDGE
-                for ev in _synthesis(model, messages, instr, effort):
+                for ev in _synthesis(model, messages, instr, effort, temperature):
                     yield ev
                 yield {"type": "done"}
                 return
@@ -905,7 +919,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
                 break
 
         instr = SYNTH_FROM_EVIDENCE if read_domains else SYNTH_FROM_KNOWLEDGE
-        for ev in _synthesis(model, messages, instr, effort):
+        for ev in _synthesis(model, messages, instr, effort, temperature):
             yield ev
         yield {"type": "done"}
     except Exception as e:
@@ -913,7 +927,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None):
         yield {"type": "done"}
 
 
-def run_agent(model, messages, min_sources=MIN_SOURCES):
+def run_agent(model, messages, min_sources=MIN_SOURCES, temperature=None):
     """Render the shared research event stream to the terminal and return the final
     answer text. The loop itself lives in research_events — this is just the CLI's
     renderer, the terminal twin of the web UI's event handler. `messages` is mutated
@@ -928,7 +942,7 @@ def run_agent(model, messages, min_sources=MIN_SOURCES):
             sys.stdout.write("\n")
             at_line_start = True
 
-    for ev in research_events(model, messages, min_sources):
+    for ev in research_events(model, messages, min_sources, temperature=temperature):
         t = ev.get("type")
         if t == "step":
             newline()
@@ -985,7 +999,7 @@ def check_model(model):
     except Exception:
         print(c(f"warning: can't reach Ollama at {OLLAMA_HOST} — is it running?", C.red))
 
-def repl(model, min_sources=MIN_SOURCES):
+def repl(model, min_sources=MIN_SOURCES, temperature=None):
     depth_label = str(min_sources) if min_sources > 0 else "auto"
     print(c(f"research agent · model={model} · depth={depth_label} · web_search + web_fetch + arxiv_search", C.bold))
     print(c("ask anything. commands: /model <name>  /depth <n>  /reset  /exit\n", C.dim))
@@ -1020,16 +1034,16 @@ def repl(model, min_sources=MIN_SOURCES):
             continue
         messages.append({"role": "user", "content": q})
         try:
-            answer = run_agent(model, messages, min_sources)
+            answer = run_agent(model, messages, min_sources, temperature)
         except KeyboardInterrupt:
             print(c("\n(interrupted)", C.yellow)); continue
         print(c("\n─── answer ───", C.bold))
         print(answer.strip(), "\n")
 
-def one_shot(model, question, min_sources=MIN_SOURCES):
+def one_shot(model, question, min_sources=MIN_SOURCES, temperature=None):
     messages = new_conversation()
     messages.append({"role": "user", "content": question})
-    answer = run_agent(model, messages, min_sources)
+    answer = run_agent(model, messages, min_sources, temperature)
     print(c("\n─── answer ───", C.bold))
     print(answer.strip())
 
@@ -1054,6 +1068,8 @@ OPTIONS:
                        (default: 0 = no gate, the model matches effort to the question)
   --deep               shortcut for --depth 5 (thorough research mode)
   --shallow            shortcut for --depth 1 (force at least one page read)
+  --temp <t>           sampling temperature {TEMP_MIN}-{TEMP_MAX} (default {TEMPERATURE}:
+                       OpenAI's recommendation for gpt-oss — lower makes it repeat itself)
   -h, --help           show this help
 
 REPL commands:  /model <name>   /depth <n>   /reset   /exit
@@ -1079,13 +1095,20 @@ def main():
         min_sources = 5; args.remove("--deep")
     if "--shallow" in args:
         min_sources = 1; args.remove("--shallow")
+    temp_opt = _take_opt(args, "--temp")
+    temperature = None
+    if temp_opt:
+        try:
+            temperature = min(TEMP_MAX, max(TEMP_MIN, float(temp_opt)))
+        except ValueError:
+            print(c(f"ignoring --temp {temp_opt!r}: not a number", C.yellow))
     question = " ".join(args).strip()
 
     check_model(model)
     if question:
-        one_shot(model, question, min_sources)
+        one_shot(model, question, min_sources, temperature)
     else:
-        repl(model, min_sources)
+        repl(model, min_sources, temperature)
 
 if __name__ == "__main__":
     main()

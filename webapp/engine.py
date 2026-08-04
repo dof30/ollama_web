@@ -90,11 +90,12 @@ def commit_turn(messages, question, answer):
 # truth shared by the terminal renderer (agent.run_agent) and this web engine. We
 # wrap it at call time (rather than aliasing the function object) so a hot-reload of
 # agent.py is picked up on the very next request without reloading this module too.
-def research_events(model, messages, min_sources=0, effort=None):
+def research_events(model, messages, min_sources=0, effort=None, temperature=None):
     """Yield research events for the web UI. The event contract is documented in
     this file's header; the implementation is agent.research_events.
     effort: the intelligence level chosen in the UI ("low"/"medium"/"high"), handed
     straight to the model as its reasoning effort. None lets the CLI's source-count
-    heuristic pick one instead."""
+    heuristic pick one instead.
+    temperature: sampling temperature for this turn; None uses agent.TEMPERATURE."""
     yield from agent.research_events(model, messages, min_sources=min_sources,
-                                     effort=effort)
+                                     effort=effort, temperature=temperature)

@@ -85,6 +85,10 @@ _session_lock = threading.Lock()
 # selector leaves it off so effort stays proportional to the question.
 EFFORT_SOURCES = {"high": 0, "medium": 0, "low": 0}
 
+# The band the temperature dial is allowed to move in — see the clamp in /api/ask.
+TEMP_MIN = float(os.environ.get("RESEARCH_TEMP_MIN", "0.4"))
+TEMP_MAX = float(os.environ.get("RESEARCH_TEMP_MAX", "1.0"))
+
 # A browser tab outlives this process: it keeps the conversation in localStorage, so
 # after a restart it asks with a sid we have never seen. Rebuild the session from the
 # tab's own copy — otherwise the page shows a conversation the model has no memory of,
@@ -355,6 +359,15 @@ class Handler(BaseHTTPRequestHandler):
         if effort not in ("low", "medium", "high"):
             effort = None
         depth = EFFORT_SOURCES.get(effort, int(req.get("depth") or 0))
+        # Sampling temperature, clamped to the useful band for this model: below ~0.4 a
+        # reasoning model starts repeating its own thinking verbatim, and above 1.0 it
+        # wanders — 1.0 is OpenAI's recommendation and the default. Anything unparseable
+        # falls back to that default rather than failing the request; a bad slider value
+        # should never cost you an answer.
+        try:
+            temperature = min(TEMP_MAX, max(TEMP_MIN, float(req["temp"])))
+        except (KeyError, TypeError, ValueError):
+            temperature = None
         if not question:
             self._send(400, json.dumps({"error": "empty question"}))
             return
@@ -381,7 +394,8 @@ class Handler(BaseHTTPRequestHandler):
         aborted = False
         t0 = time.time()
         try:
-            for ev in engine.research_events(model, work, min_sources=depth, effort=effort):
+            for ev in engine.research_events(model, work, min_sources=depth, effort=effort,
+                                             temperature=temperature):
                 if ev.get("type") == "final":
                     final_text = ev.get("text", "")
                 elif ev.get("type") == "source":

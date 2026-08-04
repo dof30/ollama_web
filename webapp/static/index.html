@@ -25,9 +25,16 @@
   body{background:var(--bg);color:var(--ink);
        font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;
        display:flex;flex-direction:column}
-  header{display:flex;gap:10px;align-items:center;padding:10px 14px;
+  header{display:flex;gap:8px;align-items:center;padding:10px 14px;
          border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
-  header .title{font-weight:600;margin-right:auto}
+  /* a long model name shouldn't be able to push the row into wrapping */
+  #model{max-width:200px}
+  /* the creativity block now carries the auto margin, so it sits beside the title
+     and everything else is pushed to the right edge */
+  header .title{font-weight:600}
+  /* The header is a single row of controls; below this the tagline is the one piece
+     that is decoration rather than function, so it steps aside before anything wraps. */
+  @media (max-width:1200px){ header .title small{display:none} }
   header .title small{color:var(--dim);font-weight:400}
   select,button{font:inherit;color:var(--ink);background:var(--panel);
                 border:1px solid var(--line);border-radius:8px;padding:6px 10px;cursor:pointer}
@@ -151,6 +158,16 @@
   #send.stopping::before{content:"";width:13px;height:13px;
                          border:2px solid currentColor;border-radius:3px}
   .hint{color:var(--dim);font-size:12px;margin-top:6px;text-align:center}
+  /* creativity — four named steps instead of a bare number; sits beside the title */
+  .creativity{display:flex;align-items:center;gap:8px;margin-right:auto}
+  .creativity>small{color:var(--dim)}
+  .levels{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .levels .lvl{border:none;border-right:1px solid var(--line);border-radius:0;
+               background:transparent;color:var(--dim);padding:5px 8px;font-size:12px;
+               cursor:pointer;transition:background .15s,color .15s}
+  .levels .lvl:last-child{border-right:none}
+  .levels .lvl:hover{background:var(--chip);color:var(--ink)}
+  .levels .lvl[aria-checked="true"]{background:var(--accent);color:var(--accent-ink)}
   /* confirm sheet — used when switching models trades one model's RAM for another's */
   .modal{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;
          background:rgba(0,0,0,.45);padding:20px}
@@ -166,6 +183,23 @@
 <body>
   <header>
     <span class="title">local research <small>· web-capable local LLM</small></span>
+    <!-- Creativity, in words rather than a number. A hidden input carries the actual
+         sampling temperature so ask() keeps reading #temp exactly as before — the same
+         trick the cups use for #effort. -->
+    <span class="creativity">
+      <small>creativity</small>
+      <span class="levels" role="radiogroup" aria-label="creativity">
+        <button type="button" class="lvl" data-temp="0.4"
+                title="Precise — sticks closely to the most likely wording. Tightest and most repeatable.">Precise</button>
+        <button type="button" class="lvl" data-temp="0.6"
+                title="Balanced — a little room to vary, still firmly grounded.">Balanced</button>
+        <button type="button" class="lvl" data-temp="0.8"
+                title="Curious — explores more phrasings and angles.">Curious</button>
+        <button type="button" class="lvl" data-temp="1" aria-checked="true"
+                title="Creative — the model's full range. Recommended for gpt-oss: it converges in its own thinking, so clamping sampling only makes it repeat itself.">Creative</button>
+      </span>
+      <input type="hidden" id="temp" value="1" autocomplete="off">
+    </span>
     <label><small style="color:var(--dim)">model</small></label>
     <select id="model"></select>
     <button id="sayhi" title="Warm up the selected model so it's ready — no need to type hi">Say Hi!</button>
@@ -401,7 +435,8 @@ async function ask(question){
       // `restore` lets the server rebuild this session if it has never heard of the
       // sid — after a server restart the tab still shows the conversation, so the
       // model must get it back too or the next follow-up answers out of nowhere.
-      body: JSON.stringify({q:question, model, effort, sid, restore: store.turns}),
+      body: JSON.stringify({q:question, model, effort, sid, temp: Number($("#temp").value),
+                            restore: store.turns}),
       signal: controller.signal,
     });
     const reader = resp.body.getReader(); const dec = new TextDecoder();
@@ -544,6 +579,26 @@ addEventListener("keydown", e=>{
   if(e.key==="Escape"){ e.preventDefault(); closeSheet(false); }
   if(e.key==="Enter"){ e.preventDefault(); closeSheet(true); }
 });
+
+// ---- temperature ----
+// A per-request sampling knob, so it costs nothing to change: unlike num_ctx it does
+// not evict the loaded model (measured: load_duration flat across 0.2/1.0/1.8). The
+// readout turns amber off 1.0 because that default is a recommendation, not a whim —
+// gpt-oss is meant to converge in its thinking, and clamping sampling is what produced
+// the repeated-thinking, re-search-the-same-page behaviour the loop detector catches.
+const TEMP_KEY="research.temp", TEMP_DEFAULT="1";
+const levelBtns = [...document.querySelectorAll(".lvl")];
+function setCreativity(v, remember=true){
+  const btn = levelBtns.find(b => b.dataset.temp === v) ||
+              levelBtns.find(b => b.dataset.temp === TEMP_DEFAULT);
+  $("#temp").value = btn.dataset.temp;
+  levelBtns.forEach(b => b.setAttribute("aria-checked", String(b === btn)));
+  if(remember) try{ localStorage.setItem(TEMP_KEY, btn.dataset.temp); }catch(e){}
+}
+levelBtns.forEach(b => b.onclick = () => setCreativity(b.dataset.temp));
+// Restore the last pick; an unknown/absent value falls back to the recommended one.
+setCreativity((()=>{ try{ return localStorage.getItem(TEMP_KEY) || TEMP_DEFAULT; }
+                     catch(e){ return TEMP_DEFAULT; } })(), false);
 
 // ---- switching models trades one model's RAM for another's ----
 // On this machine two 100B-class models don't fit at once, so picking a different one
