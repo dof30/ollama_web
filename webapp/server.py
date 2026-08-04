@@ -85,6 +85,14 @@ _session_lock = threading.Lock()
 # selector leaves it off so effort stays proportional to the question.
 EFFORT_SOURCES = {"high": 0, "medium": 0, "low": 0}
 
+# Which model this server considers ACTIVE — the one whose weights we have committed
+# RAM to. It has to live here rather than in a tab, because a tab only knows what it
+# picked: switch models in one tab and every other tab kept showing the old name and
+# would happily send the next question to it, silently evicting the model you just
+# loaded. A plain string needs no lock (assignment is atomic under the GIL) and every
+# tab learns it from /api/models on load and /api/ping while open.
+ACTIVE_MODEL = DEFAULT_MODEL
+
 # The band the temperature dial is allowed to move in — see the clamp in /api/ask.
 TEMP_MIN = float(os.environ.get("RESEARCH_TEMP_MIN", "0.4"))
 TEMP_MAX = float(os.environ.get("RESEARCH_TEMP_MAX", "1.0"))
@@ -157,12 +165,14 @@ def switch_model(old, new):
     same empty-message call, so the new model arrives warm without generating a token.
     The long timeout is the point of the whole feature: a 120B cold load is ~30s, and
     a bigger one can take minutes."""
+    global ACTIVE_MODEL
     unloaded = None
     if old and old != new and old in loaded_models():
         unload_model(old)
         unloaded = old
     set_keep_alive(new, agent.keep_alive_for(new) or IDLE_KEEP_ALIVE, timeout=600)
-    return {"ok": True, "unloaded": unloaded, "loaded": new}
+    ACTIVE_MODEL = new   # the new single source of truth every tab syncs to
+    return {"ok": True, "unloaded": unloaded, "loaded": new, "active": new}
 
 
 # ---------- tab presence -> how long the workhorse stays warm ----------
@@ -273,7 +283,8 @@ class Handler(BaseHTTPRequestHandler):
             # instance by probing ports instead of starting a duplicate.
             self._send(200, json.dumps({"app": "local-research",
                                         "models": list_models(),
-                                        "default": DEFAULT_MODEL}))
+                                        "default": DEFAULT_MODEL,
+                                        "active": ACTIVE_MODEL}))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -303,7 +314,9 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         PRESENCE.pop(tab, None)
             apply_presence()  # react at once when the first tab opens / the last closes
-            self._send(200, json.dumps({"ok": True}))
+            # The heartbeat carries the active model back, so a tab that was open when
+            # another one switched corrects itself instead of asking the wrong model.
+            self._send(200, json.dumps({"ok": True, "active": ACTIVE_MODEL}))
             return
         if self.path == "/api/unload":
             length = int(self.headers.get("Content-Length", 0))
@@ -371,6 +384,14 @@ class Handler(BaseHTTPRequestHandler):
         if not question:
             self._send(400, json.dumps({"error": "empty question"}))
             return
+        # A question from a tab that is out of date about which model is loaded would
+        # silently evict the active one and load its own — the exact accident switching
+        # models in another tab used to cause. Refuse instead, and say what is actually
+        # active so the tab can correct itself and hand the question back for a re-send.
+        # Changing model is a deliberate, confirmed act now; it can't happen by typing.
+        if model != ACTIVE_MODEL:
+            self._send(409, json.dumps({"error": "stale model", "active": ACTIVE_MODEL}))
+            return
 
         # Claim the session, then work on a private copy. A stopped turn's thread keeps
         # running until its next write fails, so it can still be alive when the next
@@ -421,7 +442,26 @@ class Handler(BaseHTTPRequestHandler):
                            sources, time.time() - t0)
 
 
+def adopt_resident_model():
+    """Start up believing whatever Ollama already has in RAM.
+
+    The server can be restarted (a code edit, a crash) while a model is resident. If we
+    just assumed DEFAULT_MODEL, the UI would show that name while a different model held
+    the RAM, and the first question would evict it. Prefer the default when it is the one
+    loaded, else adopt whichever is. Best effort: if Ollama is down we keep the default."""
+    global ACTIVE_MODEL
+    try:
+        resident = loaded_models()
+    except Exception:
+        return
+    if resident and DEFAULT_MODEL not in resident:
+        ACTIVE_MODEL = resident[0]
+        print(f"adopting resident model {ACTIVE_MODEL} (default {DEFAULT_MODEL} is not loaded)",
+              flush=True)
+
+
 def main():
+    adopt_resident_model()
     # Try the preferred port, then a few above it, so a stale instance already on
     # 8765 doesn't crash us with "Address already in use" — we just move over.
     last_err = None

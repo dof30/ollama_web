@@ -325,9 +325,12 @@ async function loadModels(){
   try{
     const r = await fetch("/api/models"); const d = await r.json();
     const sel = $("#model"); sel.innerHTML="";
+    // Select what the SERVER says is active, not our own default: another tab may have
+    // switched models since, and this tab must not open showing a model that isn't loaded.
+    const active = d.active || d.default;
     (d.models||[]).forEach(name=>{
       const o=document.createElement("option"); o.value=o.textContent=name;
-      if(name===d.default) o.selected=true; sel.appendChild(o);
+      if(name===active) o.selected=true; sel.appendChild(o);
     });
     if(!d.models || !d.models.length){ const o=document.createElement("option"); o.textContent="(no models)"; sel.appendChild(o); }
     currentModel = sel.value;   // the baseline a switch is measured against
@@ -439,6 +442,16 @@ async function ask(question){
                             restore: store.turns}),
       signal: controller.signal,
     });
+    if(resp.status === 409){
+      // This tab was out of date about which model is loaded. Correct it, and give the
+      // question back to the composer rather than sending it to the wrong model.
+      const d = await resp.json().catch(()=>({}));
+      ctx.t.remove();
+      adoptActive(d.active, true);
+      $("#q").value = question; autosize($("#q"));
+      flashHint("another tab switched to "+d.active+" — your question is back in the box");
+      return;
+    }
     const reader = resp.body.getReader(); const dec = new TextDecoder();
     let buf="";
     while(true){
@@ -600,6 +613,28 @@ levelBtns.forEach(b => b.onclick = () => setCreativity(b.dataset.temp));
 setCreativity((()=>{ try{ return localStorage.getItem(TEMP_KEY) || TEMP_DEFAULT; }
                      catch(e){ return TEMP_DEFAULT; } })(), false);
 
+// Follow the server's view of which model is loaded. Called on the heartbeat, when
+// another tab broadcasts a switch, and when a question is refused as stale — so a tab
+// left open while another switched corrects itself instead of asking the wrong model.
+const ACTIVE_KEY="research.active";
+// `force` is for the refused-question path: the run is being abandoned there, so the
+// usual "don't move the selector under a live turn" guard must not block the correction.
+function adoptActive(name, force){
+  const sel=$("#model");
+  if(!name || name===currentModel) return;
+  if(controller && !force) return;                          // mid-run: leave the live turn alone
+  if(![...sel.options].some(o=>o.value===name)) return;     // unknown here; a reload will fix it
+  sel.value=name; currentModel=name;
+  flashHint("model changed elsewhere — now on "+name);
+}
+// Same-browser tabs shouldn't wait for the next heartbeat to find out.
+function broadcastActive(name){
+  try{ localStorage.setItem(ACTIVE_KEY, name+"|"+Date.now()); }catch(e){}
+}
+addEventListener("storage", e=>{
+  if(e.key===ACTIVE_KEY) adoptActive((e.newValue||"").split("|")[0]);
+});
+
 // ---- switching models trades one model's RAM for another's ----
 // On this machine two 100B-class models don't fit at once, so picking a different one
 // is not a free menu choice: the old one is dropped and the new one is pulled in (~30s
@@ -625,6 +660,7 @@ $("#model").addEventListener("change", async () => {
                                          body:JSON.stringify({from:prev, to:next})});
     if(!r.ok) throw new Error("HTTP "+r.status);
     currentModel = next;
+    broadcastActive(next);        // other tabs update now, not on their next heartbeat
     flashHint("✓ "+next+" is loaded and ready");
   }catch(e){
     sel.value = prev;    // the switch failed; the selector must not lie about what's live
@@ -743,7 +779,13 @@ document.addEventListener("keydown", e => {
 const tabId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
 const beat = (path, keepalive) => fetch(path, {method:"POST", keepalive,
   headers:{"Content-Type":"application/json"}, body:JSON.stringify({tab:tabId})}).catch(()=>{});
-const ping = () => beat("/api/ping", false);
+// The heartbeat doubles as the sync channel: its reply says which model the server
+// considers active, so a tab open since before a switch corrects itself.
+const ping = async () => {
+  const r = await beat("/api/ping", false);
+  if(!r || !r.ok) return;
+  try{ adoptActive((await r.json()).active); }catch(e){}
+};
 ping(); setInterval(ping, 30000);
 // pagehide covers close/navigate/mobile better than beforeunload; sendBeacon survives
 // the teardown. If the page comes back from the bfcache, re-announce ourselves.
