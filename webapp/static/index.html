@@ -250,6 +250,7 @@
 const $ = s => document.querySelector(s);
 const turns = $("#turns"), convo = $("#convo");
 let controller = null, liveQuestion = null;
+let switching = false;   // a model is being loaded into RAM; sending must wait for it
 
 // ---- the conversation, kept in localStorage ----
 // Without this the TAB is the conversation: sid was regenerated on every page load,
@@ -567,13 +568,19 @@ function handle(ctx, ev){
 
 // ---- wiring ----
 const hintEl=$("#hint"), hintDefault=hintEl.textContent; let hintTimer=null;
+// A flashed hint falls back to `hintBase`, not always the default line: while something
+// long is running (a model load) the status there must survive a passing message.
+let hintBase = hintDefault;
 function flashHint(msg){
   hintEl.textContent=msg;
-  clearTimeout(hintTimer); hintTimer=setTimeout(()=>hintEl.textContent=hintDefault, 2000);
+  clearTimeout(hintTimer); hintTimer=setTimeout(()=>hintEl.textContent=hintBase, 2000);
 }
 // Same line, but it stays put — for work that outlasts flashHint's 2s (a cold model
-// load runs ~30s and longer for the big ones). Ended by the next flashHint.
-function holdHint(msg){ clearTimeout(hintTimer); hintEl.textContent=msg; }
+// load runs ~30s, minutes for the biggest). Call holdHint(null) to end it.
+function holdHint(msg){
+  hintBase = msg || hintDefault;
+  clearTimeout(hintTimer); hintEl.textContent = hintBase;
+}
 
 // ---- confirm sheet ----
 // Resolves true on OK, false on Cancel / Esc / clicking the backdrop.
@@ -653,19 +660,19 @@ $("#model").addEventListener("change", async () => {
     `<p>Loading the new model takes ~30s (longer for the largest ones). ` +
     `Your conversation is kept.</p>`);
   if(!ok){ sel.value = prev; return; }
-  sel.disabled=true;
-  holdHint("⟳ switching to "+next+" — loading into memory…");
+  sel.disabled=true; switching=true;   // send stays locked until the weights are in RAM
+  holdHint("⟳ loading "+next+" into memory — send unlocks when it's ready…");
   try{
     const r = await fetch("/api/switch",{method:"POST",headers:{"Content-Type":"application/json"},
                                          body:JSON.stringify({from:prev, to:next})});
     if(!r.ok) throw new Error("HTTP "+r.status);
     currentModel = next;
     broadcastActive(next);        // other tabs update now, not on their next heartbeat
-    flashHint("✓ "+next+" is loaded and ready");
+    holdHint(null); flashHint("✓ "+next+" is loaded and ready");
   }catch(e){
     sel.value = prev;    // the switch failed; the selector must not lie about what's live
-    flashHint("⚠ switch failed — staying on "+prev);
-  }finally{ sel.disabled=false; }
+    holdHint(null); flashHint("⚠ switch failed — staying on "+prev);
+  }finally{ sel.disabled=false; switching=false; }
 });
 // Shell-style command history: Up/Down cycle through prior questions.
 const history=[]; let hIdx=0, draft="";
@@ -673,6 +680,11 @@ function send(){
   // While an answer is streaming, typing is free but sending is locked: wait for
   // it to finish or press Stop. The drafted text stays in the box either way.
   if(controller){ flashHint("⏳ model is still answering — wait or press Stop, your draft is kept"); return; }
+  // Same during a model switch. A 120B takes ~30s to load and a bigger one minutes,
+  // and the server only calls the new model active once the weights are actually in.
+  // Without this the question would be sent to a model that isn't loaded yet, get
+  // refused as stale, and bounce back into the box looking like "send is broken".
+  if(switching){ flashHint("⏳ still loading "+$("#model").value+" — your draft is kept"); return; }
   const q=$("#q").value.trim(); if(!q) return;
   if(history[history.length-1]!==q) history.push(q);  // no consecutive dupes
   hIdx=history.length; draft="";
@@ -732,7 +744,7 @@ $("#newchat").onclick=()=>{
   if(controller) controller.abort();
   store={sid:crypto.randomUUID(), turns:[]}; sid=store.sid; saveStore();
   turns.innerHTML=""; $("#q").focus(); };
-$("#sayhi").onclick=()=>{ if(controller) return; stick=true; ask("Hi"); };  // warm the model without typing
+$("#sayhi").onclick=()=>{ if(controller || switching) return; stick=true; ask("Hi"); };  // warm the model without typing
 $("#deactivate").onclick=async()=>{                       // unload the model from RAM on demand
   const m=$("#model").value;
   if(!m || m==="(no models)") return;
