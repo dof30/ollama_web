@@ -178,6 +178,21 @@
   .sheet p{margin:0 0 8px;color:var(--dim);font-size:14px;line-height:1.55}
   .sheet .name{color:var(--ink);font-weight:600;word-break:break-all}
   .modalbar{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+  /* Dictation sits next to Send, pinned the same way — the two things that put words
+     in front of the model share one corner. Recording turns it the stop colour and
+     breathes, so the open microphone is visible without reading the hint line. */
+  #mic{position:absolute;right:41px;bottom:6px;width:32px;height:32px;padding:0;
+       background:none;border:none;color:var(--dim);
+       display:flex;align-items:center;justify-content:center}
+  #mic svg{width:17px;height:17px;fill:currentColor}
+  #mic:hover{color:var(--ink)}
+  #mic.rec{color:var(--stop);animation:micpulse 1.4s ease-in-out infinite}
+  #mic.busy{opacity:.45;cursor:default;animation:none}
+  @keyframes micpulse{50%{opacity:.35}}
+  /* The box only gives up the extra right margin once the server says it can
+     transcribe; without dictation the text still runs to within 48px of the edge. */
+  body.voice textarea{padding-right:80px}
+  @media (prefers-reduced-motion:reduce){ #mic.rec{animation:none} }
 </style>
 </head>
 <body>
@@ -226,6 +241,7 @@
            min-height can't shrink, and the first keystroke snapped it down to one. -->
       <div class="qwrap">
         <textarea id="q" rows="1" placeholder="Ask anything — parentheses, quotes, symbols all fine here."></textarea>
+        <button id="mic" hidden aria-label="Dictate" title="Dictate — click to start, click again to stop"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M6 11a1 1 0 0 1 2 0 4 4 0 0 0 8 0 1 1 0 0 1 2 0 6 6 0 0 1-5 5.92V19h2a1 1 0 0 1 0 2H9a1 1 0 0 1 0-2h2v-2.08A6 6 0 0 1 6 11z"/></svg></button>
         <button id="send" title="Send — or press Enter">⏎</button>
       </div>
       <div class="effortpick" data-level="medium">
@@ -335,6 +351,12 @@ async function loadModels(){
     });
     if(!d.models || !d.models.length){ const o=document.createElement("option"); o.textContent="(no models)"; sel.appendChild(o); }
     currentModel = sel.value;   // the baseline a switch is measured against
+    // The mic exists only if the server can transcribe AND this browser will hand us
+    // audio: getUserMedia is absent outside a secure context, and Firefox can null it
+    // out entirely via media.navigator.enabled.
+    if(d.voice && navigator.mediaDevices?.getUserMedia && window.MediaRecorder){
+      $("#mic").hidden=false; document.body.classList.add("voice");
+    }
   }catch(e){ /* offline is fine; server will error clearly on send */ }
 }
 
@@ -838,6 +860,170 @@ addEventListener("storage", e => {
   }
   stickToBottom();
 });
+
+// ---- dictation: click to start, click to stop, then send it yourself ----
+// Two explicit triggers, no voice-activity detection, nothing that starts on its own.
+// The transcript lands in the box and is NEVER auto-sent — you read it, fix any
+// misheard word, and press Enter. That is the same contract as ✎ edit and Stop:
+// nothing puts words in front of the model without you looking at them first.
+const mic = $("#mic");
+const MIC_MAX_MS = 90000;      // a forgotten recording stops itself, and stays under the body cap
+let recorder=null, recStream=null, recChunks=[], recTimer=null, recState="idle";
+// The hint line is one slot and a model load may already own it, so put back what was
+// there rather than assuming the default line.
+let hintBeforeMic = null;
+function micHint(msg){
+  if(hintBeforeMic===null) hintBeforeMic = hintBase;
+  holdHint(msg);
+}
+function micUnhint(){
+  if(hintBeforeMic===null) return;
+  holdHint(hintBeforeMic===hintDefault ? null : hintBeforeMic);
+  hintBeforeMic = null;
+}
+
+function micIdle(){
+  recState="idle";
+  clearInterval(recTimer); recTimer=null;
+  mic.classList.remove("rec","busy"); mic.disabled=false;
+  mic.title="Dictate — click to start, click again to stop";
+}
+// Called on every exit path. Without it Firefox leaves the tab's recording indicator
+// lit and the OS still believes something is listening.
+function micRelease(){
+  if(recStream){ recStream.getTracks().forEach(t=>t.stop()); recStream=null; }
+}
+
+async function micStart(){
+  if(recState!=="idle") return;
+  // Don't show a recording state until permission actually lands — the Firefox
+  // doorhanger can sit for ten seconds, and talking into it wastes a sentence.
+  recState="asking"; mic.disabled=true; mic.classList.add("busy");
+  micHint("waiting for the microphone…");
+  try{
+    recStream = await navigator.mediaDevices.getUserMedia({audio:{
+      channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+  }catch(e){
+    micIdle(); micUnhint();
+    flashHint(e.name==="NotAllowedError"  ? "microphone blocked — allow it from the address bar"
+            : e.name==="NotFoundError"    ? "no microphone found"
+            : e.name==="NotReadableError" ? "microphone is in use by another app"
+            : "couldn't start recording ("+e.name+")");
+    return;
+  }
+  recChunks=[];
+  const mime=["audio/ogg;codecs=opus","audio/webm;codecs=opus","audio/ogg","audio/webm"]
+              .find(t=>MediaRecorder.isTypeSupported(t));
+  recorder = new MediaRecorder(recStream, mime?{mimeType:mime}:undefined);
+  recorder.ondataavailable = e => { if(e.data.size) recChunks.push(e.data); };
+  recorder.onerror = () => { micStop(true); micUnhint(); flashHint("recording failed"); };
+  recorder.onstop = micFinished;
+  recorder.start();
+  recState="recording"; mic.disabled=false; mic.classList.remove("busy");
+  mic.classList.add("rec"); mic.title="Click to stop · Esc to discard";
+  const t0=Date.now();
+  const tick=()=>{
+    const s=Math.floor((Date.now()-t0)/1000);   // a stopwatch, not a rounder: 0:01 = one second gone
+    micHint("recording "+Math.floor(s/60)+":"+String(s%60).padStart(2,"0")
+            +" · click the mic to stop · Esc to discard");
+    if(s*1000>=MIC_MAX_MS) micStop();           // a forgotten mic transcribes what it got
+  };
+  tick(); recTimer=setInterval(tick,1000);
+  document.addEventListener("keydown", micEscape);
+}
+
+function micStop(cancel){
+  if(recState!=="recording") return;
+  recState = cancel ? "cancelled" : "working";
+  clearInterval(recTimer); recTimer=null;
+  document.removeEventListener("keydown", micEscape);
+  mic.classList.remove("rec"); mic.classList.add("busy"); mic.disabled=true;
+  if(!cancel) micHint("transcribing…");
+  // If stop() throws, onstop will never fire — finish by hand, but disarm the handler
+  // first so a late event can't run the upload a second time with an empty blob.
+  try{ recorder.stop(); }catch(e){ recorder.onstop=null; micFinished(); }
+}
+function micEscape(e){
+  if(e.key!=="Escape") return;
+  e.preventDefault(); micStop(true);
+  micUnhint(); flashHint("recording discarded");
+}
+
+async function micFinished(){
+  micRelease();                                  // kill the recording indicator first
+  const blob=new Blob(recChunks); recChunks=[];
+  const cancelled = recState==="cancelled";
+  // "transcribing…" has to stay up until there is something to say instead of it, so
+  // the outcome is decided first and only then replaces the held hint.
+  let said=null, text=null;
+  try{
+    if(cancelled) return;
+    const wav=await blobToWav(blob);
+    if(!wav){ said="didn't catch anything"; return; }
+    const r=await fetch("/api/transcribe",{method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify({wav})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){ said=d.error||("transcription failed ("+r.status+")"); return; }
+    text=(d.text||"").trim();
+    if(!text) said="didn't catch anything";
+  }catch(e){ said="transcription failed: "+e.message; }
+  finally{
+    micIdle(); micUnhint();
+    if(text) dictate(text); else if(said) flashHint(said);
+  }
+}
+
+// decodeAudioData resamples to its context's rate for us — hence an OfflineAudioContext
+// fixed at 16000, which is the only rate whisper reads. A *live* AudioContext cannot be
+// pinned there: Firefox refuses to connect a mic running at a different rate. So there
+// is no worklet and no resampler of our own.
+async function blobToWav(blob){
+  const buf=await new OfflineAudioContext(1,1,16000).decodeAudioData(await blob.arrayBuffer());
+  let pcm=buf.getChannelData(0);
+  if(buf.numberOfChannels>1){        // decodeAudioData keeps the SOURCE channel count
+    const r=buf.getChannelData(1), mixed=new Float32Array(pcm.length);
+    for(let i=0;i<pcm.length;i++) mixed[i]=(pcm[i]+r[i])/2;
+    pcm=mixed;
+  }
+  // Too short or too quiet to be speech. Worth catching here: asked to transcribe
+  // silence, whisper does not return nothing — it invents a polite "Thank you."
+  let sum=0; for(let i=0;i<pcm.length;i++) sum+=pcm[i]*pcm[i];
+  if(pcm.length < buf.sampleRate*0.4 || Math.sqrt(sum/(pcm.length||1)) < 0.005) return null;
+  return wavBase64(pcm, buf.sampleRate);
+}
+
+// A 44-byte RIFF header around 16-bit samples, written by hand — the same spirit as
+// this file's markdown renderer, and it saves shipping a library.
+function wavBase64(pcm, rate){
+  const bytes=new Uint8Array(44+pcm.length*2), dv=new DataView(bytes.buffer);
+  const tag=(off,s)=>{ for(let i=0;i<s.length;i++) dv.setUint8(off+i, s.charCodeAt(i)); };
+  tag(0,"RIFF");  dv.setUint32(4, 36+pcm.length*2, true);
+  tag(8,"WAVEfmt ");
+  dv.setUint32(16,16,true); dv.setUint16(20,1,true);
+  dv.setUint16(22,1,true);  dv.setUint32(24,rate,true);
+  dv.setUint32(28,rate*2,true); dv.setUint16(32,2,true); dv.setUint16(34,16,true);
+  tag(36,"data"); dv.setUint32(40, pcm.length*2, true);
+  for(let i=0;i<pcm.length;i++){
+    const s=Math.max(-1,Math.min(1,pcm[i]));
+    dv.setInt16(44+i*2, s<0 ? s*0x8000 : s*0x7fff, true);
+  }
+  let bin="";   // btoa wants a binary string; chunk it so a long clip can't blow the arg limit
+  for(let i=0;i<bytes.length;i+=0x8000) bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+0x8000));
+  return btoa(bin);
+}
+
+// Append, never replace: typing half a question and dictating the rest is a real way
+// to work, and nothing else in this app clobbers what is already in the box.
+function dictate(text){
+  const el=$("#q"), cur=el.value;
+  el.value = cur && !/\s$/.test(cur) ? cur+" "+text : cur+text;
+  autosize(el); el.focus();
+  el.setSelectionRange(el.value.length, el.value.length);
+  flashHint("dictated — read it, then press Enter to send");
+}
+
+mic.onclick = () => { recState==="recording" ? micStop() : micStart(); };
+addEventListener("pagehide", micRelease);
 
 loadModels(); $("#q").focus();
 </script>

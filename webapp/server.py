@@ -10,6 +10,7 @@ whole run is visible live. Runs on localhost only.
     RESEARCH_WEB_PORT=9000 python3 server.py
 """
 
+import base64
 import importlib
 import json
 import os
@@ -24,6 +25,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import agent    # noqa: E402  (engine's dependency; held here so we can hot-reload it)
 import engine   # noqa: E402
 import history  # noqa: E402  (write-only recorder; no HTTP route ever reads it)
+# Deliberately NOT hot-reloaded: reloading it would drop the resident whisper model and
+# pay the load again on the next click.
+import voice    # noqa: E402  (dictation; inert if faster-whisper is absent)
 
 # Hot-reload the research code on edit, so a fix on disk is a fix live — matching
 # how index.html is already served fresh each request. Without this, agent.py /
@@ -67,6 +71,11 @@ PORT = int(os.environ.get("RESEARCH_WEB_PORT", "8765"))
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "gpt-oss:120b-fast")
+
+# How much request body we will read. Everything but dictation carries a few short
+# fields; a recording is up to ~90s of 16 kHz mono WAV, base64-inflated by a third.
+MAX_BODY = 64 * 1024
+MAX_AUDIO_BODY = 6 * 1024 * 1024
 
 # In-memory conversation store: session id -> messages. Single local user, so a
 # plain dict is fine; restart clears it (like the CLI's /reset).
@@ -268,6 +277,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _reject(self, code, msg):
+        """Error out AND hang up. Any path that answers without reading the body must:
+        under HTTP/1.1 keep-alive the unread bytes are parsed as the next request line,
+        so bailing out of a multi-megabyte audio POST would desync the socket."""
+        self._send(code, json.dumps({"error": msg}), extra={"Connection": "close"})
+
+    def _read_json(self, limit=MAX_BODY):
+        """Parse this request's JSON body, or return None having already answered.
+        Content-Length is caller-controlled, so it is checked BEFORE we allocate."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = -1
+        if length < 0:
+            self._reject(400, "bad Content-Length")
+            return None
+        if length > limit:
+            self._reject(413, "body too large")
+            return None
+        try:
+            return json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            self._reject(400, "bad json")
+            return None
+
     def do_GET(self):
         if not self._local_ok():
             self._send(403, json.dumps({"error": "forbidden"}))
@@ -281,12 +315,43 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/models":
             # "app" marks this as our server so the launcher can find a running
             # instance by probing ports instead of starting a duplicate.
+            # "voice" tells the page whether to draw the mic button at all — this is
+            # already the handshake, so dictation costs no extra round trip.
             self._send(200, json.dumps({"app": "local-research",
                                         "models": list_models(),
                                         "default": DEFAULT_MODEL,
-                                        "active": ACTIVE_MODEL}))
+                                        "active": ACTIVE_MODEL,
+                                        "voice": voice.available()}))
         else:
             self._send(404, json.dumps({"error": "not found"}))
+
+    def _transcribe(self):
+        """Recorded audio in (base64 WAV), text out. Dictation only: the transcript
+        goes to the composer for you to read and send — nothing is asked from here.
+
+        The WAV rides inside the ordinary JSON body rather than as a raw audio/wav
+        upload, to keep the Content-Type check above free of exceptions: a carve-out
+        for one route is how a security rule quietly starts to rot. Base64 costs a
+        third more bytes over loopback, which is nothing."""
+        if not voice.available():
+            self._reject(503, "dictation is not available on this server")
+            return
+        req = self._read_json(limit=MAX_AUDIO_BODY)
+        if req is None:
+            return
+        try:
+            wav = base64.b64decode(req.get("wav") or "", validate=True)
+        except Exception:
+            self._send(400, json.dumps({"error": "wav must be base64"}))
+            return
+        # Check the bytes really are a RIFF/WAVE before handing them to a decoder.
+        if len(wav) < 44 or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+            self._send(400, json.dumps({"error": "not a WAV file"}))
+            return
+        try:
+            self._send(200, json.dumps({"text": voice.transcribe(wav)}))
+        except Exception as e:
+            self._send(500, json.dumps({"error": f"{type(e).__name__}: {e}"}))
 
     def do_POST(self):
         if not self._local_ok():
@@ -297,15 +362,16 @@ class Handler(BaseHTTPRequestHandler):
         # never approve) — so this one header cheaply blocks drive-by POSTs.
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/json":
-            self._send(400, json.dumps({"error": "expected application/json"}))
+            self._reject(400, "expected application/json")   # body goes unread
             return
         hot_reload()  # pick up any edits to agent.py / engine.py before serving
+        if self.path == "/api/transcribe":
+            self._transcribe()
+            return
         if self.path in ("/api/ping", "/api/bye"):
-            length = int(self.headers.get("Content-Length", 0))
-            try:
-                req = json.loads(self.rfile.read(length) or b"{}")
-            except Exception:
-                req = {}
+            req = self._read_json()
+            if req is None:
+                return
             tab = str(req.get("tab") or "")[:64]
             if tab:
                 with _presence_lock:
@@ -319,11 +385,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True, "active": ACTIVE_MODEL}))
             return
         if self.path == "/api/unload":
-            length = int(self.headers.get("Content-Length", 0))
-            try:
-                req = json.loads(self.rfile.read(length) or b"{}")
-            except Exception:
-                self._send(400, json.dumps({"error": "bad json"}))
+            req = self._read_json()
+            if req is None:
                 return
             name = (req.get("model") or "").strip()
             if not name:
@@ -336,11 +399,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(502, json.dumps({"error": f"{type(e).__name__}: {e}"}))
             return
         if self.path == "/api/switch":
-            length = int(self.headers.get("Content-Length", 0))
-            try:
-                req = json.loads(self.rfile.read(length) or b"{}")
-            except Exception:
-                self._send(400, json.dumps({"error": "bad json"}))
+            req = self._read_json()
+            if req is None:
                 return
             new = (req.get("to") or "").strip()
             if not new:
@@ -354,11 +414,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/api/ask":
             self._send(404, json.dumps({"error": "not found"}))
             return
-        length = int(self.headers.get("Content-Length", 0))
-        try:
-            req = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:
-            self._send(400, json.dumps({"error": "bad json"}))
+        req = self._read_json()
+        if req is None:
             return
 
         question = (req.get("q") or "").strip()
