@@ -410,10 +410,25 @@ async function loadModels(){
     // Select what the SERVER says is active, not our own default: another tab may have
     // switched models since, and this tab must not open showing a model that isn't loaded.
     const active = d.active || d.default;
-    (d.models||[]).forEach(name=>{
+    // Qwen gets a group of its own at the bottom. It sees occasional use here, and one flat
+    // alphabetical list kept seating it next to the two models that get reached for daily.
+    // Grouped rather than hidden: still one click away on the day it IS the right tool.
+    const option = name => {
       const o=document.createElement("option"); o.value=o.textContent=name;
-      if(name===active) o.selected=true; sel.appendChild(o);
-    });
+      if(name===active) o.selected=true; return o;
+    };
+    const qwen = (d.models||[]).filter(n => /^qwen/i.test(n));
+    const rest = (d.models||[]).filter(n => !/^qwen/i.test(n));
+    if(qwen.length && rest.length){
+      [["Everyday", rest], ["Qwen", qwen]].forEach(([label, names]) => {
+        const og=document.createElement("optgroup"); og.label=label;
+        names.forEach(n => og.appendChild(option(n)));
+        sel.appendChild(og);
+      });
+    }else{
+      // Only one kind present — a lone group heading would be noise, so keep it flat.
+      (d.models||[]).forEach(n => sel.appendChild(option(n)));
+    }
     if(!d.models || !d.models.length){ const o=document.createElement("option"); o.textContent="(no models)"; sel.appendChild(o); }
     currentModel = sel.value;   // the baseline a switch is measured against
     // The mic exists only if the server can transcribe AND this browser will hand us

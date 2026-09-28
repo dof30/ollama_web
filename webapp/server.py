@@ -146,11 +146,21 @@ def seed_session(restore):
     return messages
 
 
+# An embedding model cannot hold a conversation — /api/chat on one errors out — so it has
+# no business in a picker whose only job is choosing who answers. Ollama's tag list carries
+# no capability flag, but every embedding model on the hub says so in its name, and a chat
+# model that happens to say "embed" is not a thing. Filtered here rather than in the UI: a
+# model that cannot answer must not be selectable by ANY client, and the RAM-admission
+# paths read this same list.
+EMBEDDING_NAME = re.compile(r"embed", re.I)
+
+
 def list_models():
     try:
         with urllib.request.urlopen(OLLAMA_HOST + "/api/tags", timeout=5) as r:
             tags = json.load(r)
-        return [m["name"] for m in tags.get("models", [])]
+        return [m["name"] for m in tags.get("models", [])
+                if not EMBEDDING_NAME.search(m["name"])]
     except Exception:
         return []
 
