@@ -36,7 +36,7 @@ except ImportError:
 
 # ---------- config ----------
 OLLAMA_HOST   = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "gpt-oss:120b-fast")
+DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "gemma4:26b")  # fits beside a llama.cpp server
 NUM_CTX       = int(os.environ.get("RESEARCH_NUM_CTX", "32768"))  # headroom for deep multi-fetch turns
 MAX_STEPS     = int(os.environ.get("RESEARCH_MAX_STEPS", "12"))
 FETCH_CHARS   = int(os.environ.get("RESEARCH_FETCH_CHARS", "6000"))
@@ -60,6 +60,16 @@ MAX_STEPS_HIGH = int(os.environ.get("RESEARCH_MAX_STEPS_HIGH", "16"))
 # How many refunded (all-tools-failed) steps a single run may take before we stop
 # refunding. Bounds the loop: iterations <= max_steps + MAX_WASTED_STEPS + 1.
 MAX_WASTED_STEPS = int(os.environ.get("RESEARCH_MAX_WASTED_STEPS", "4"))
+# Refunding only covers steps where every tool ERRORED. The commoner disappointment is
+# a page that loads perfectly and says nothing useful — that spends a step and the
+# refund never fires, because from the outside it looks like a successful read. Only
+# the model knows the difference, so let it say so: `more_steps` is a tool it can call
+# to buy itself more room when the sources it drew were poor. Bad luck with sources
+# should not force a thin answer.
+# Bounded, because "let it decide" cannot mean "let it run forever": at most
+# MAX_EXTENSIONS grants of STEP_EXTENSION steps each.
+STEP_EXTENSION = int(os.environ.get("RESEARCH_STEP_EXTENSION", "6"))
+MAX_EXTENSIONS = int(os.environ.get("RESEARCH_MAX_EXTENSIONS", "2"))
 
 
 def steps_for(effort):
@@ -77,19 +87,28 @@ UA = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
 # decision. The app carries only the ONE exception a single global value can't
 # express: the workhorse we reach for constantly is worth keeping warm (a cold load
 # costs ~30s), so for sticky models we override keep_alive to 45min, refreshed by each
-# use; the web UI's Deactivate button is the manual off-switch. Non-sticky models send
+# use and renewed while a tab is open (see apply_presence in webapp/server.py); the
+# web UI's Deactivate button is the manual off-switch. Non-sticky models send
 # no keep_alive field at all, so the server's global default governs them. (A finite
 # duration on purpose — never -1, which pins a model in RAM "forever" and once wedged
 # one with a year-2318 expiry.)
 KEEP_ALIVE_STICKY = os.environ.get("RESEARCH_KEEP_ALIVE_STICKY", "45m")
-# Models that stay resident. Comma-separated env override; defaults to the workhorse.
+# Models that stay resident. Comma-separated env override, matched as PREFIXES: the
+# entry was once the exact name "gpt-oss:120b-fast", which meant that running on plain
+# "gpt-oss:120b" — a different tag of the same workhorse — got no protection at all and
+# fell to the 5m global, dropping ~65 GB out from under an open tab. A prefix covers
+# every tag of the family, and a full name still matches itself exactly.
 STICKY_MODELS = set(filter(None,
-    os.environ.get("RESEARCH_STICKY_MODELS", "gpt-oss:120b-fast").split(",")))
+    (s.strip() for s in os.environ.get("RESEARCH_STICKY_MODELS", "gpt-oss").split(","))))
+
+def is_sticky(model):
+    """True for a model we hold in RAM for as long as someone has a tab open."""
+    return any(model.startswith(prefix) for prefix in STICKY_MODELS)
 
 def keep_alive_for(model):
     """The keep_alive to send for this model, or None to defer to the server's
     global OLLAMA_KEEP_ALIVE default."""
-    return KEEP_ALIVE_STICKY if model in STICKY_MODELS else None
+    return KEEP_ALIVE_STICKY if is_sticky(model) else None
 
 # ---------- terminal colors ----------
 class C:
@@ -119,8 +138,65 @@ class UnusableSource(Exception):
     every one of these as a step that cost the user nothing and gives the step back."""
 
 
+# A search used to return ten one-line snippets, and reading any of them cost a whole
+# extra step: another full generation to decide which URL, then the fetch. Measured on
+# this machine, a 13-step run spent 87% of its 296s generating tokens and only 13% on
+# the network — so every round trip we can delete is worth far more than any speed-up
+# to the network itself.
+#
+# So a search now also OPENS the top few results and returns their text. The fetches
+# run concurrently: they are different hosts, so three cost about as long as one, and
+# this is the one place in the whole loop where real parallelism is available (the GPU
+# cannot be parallelised on this box; the network can). The model can usually answer, or
+# decide what to read properly, straight from the search observation.
+# Sizing these is a genuine trade, and the first attempt got it wrong. At 3 previews of
+# 1800 chars, a deep question measured 432s against 296s before — network fell from 39s
+# to 7s while GENERATION rose from 257s to 425s. Every preview stays in the transcript
+# and is re-read on every later step, and on this machine context costs more than the
+# network ever did. The step count did not fall, so the bloat bought nothing.
+#
+# So: enough to settle a lookup without a second round trip, not enough to be a page
+# dump. Two previews at 900 chars is a third of the original bulk. Set
+# RESEARCH_SEARCH_PREVIEW=0 to switch previews off entirely.
+SEARCH_PREVIEW_N = int(os.environ.get("RESEARCH_SEARCH_PREVIEW", "2"))
+SEARCH_PREVIEW_CHARS = int(os.environ.get("RESEARCH_SEARCH_PREVIEW_CHARS", "900"))
+
+
+def _preview_one(url):
+    """Body text of `url`, trimmed to preview length. Never raises — a preview that
+    fails is simply absent, and the model still has the snippet and can web_fetch."""
+    try:
+        page = web_fetch(url)
+    except Exception:
+        return ""
+    body = page.split("\n\n", 1)[-1]        # drop the TITLE/URL header web_fetch adds
+    body = body.strip()
+    if len(body) > SEARCH_PREVIEW_CHARS:
+        body = body[:SEARCH_PREVIEW_CHARS].rstrip() + " …"
+    return body
+
+
+def _attach_previews(items):
+    """Fetch several pages at once and hang the text on each item, in place."""
+    items = [it for it in items if it.get("url")]
+    if not items:
+        return
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=len(items)) as pool:
+        futures = {pool.submit(_preview_one, it["url"]): it for it in items}
+        for fut in as_completed(futures):
+            try:
+                futures[fut]["preview"] = fut.result()
+            except Exception:
+                futures[fut]["preview"] = ""
+
+
 def web_search(query, max_results=5):
-    """Search the web via DuckDuckGo. Returns a list of {title, url, snippet}."""
+    """Search the web via DuckDuckGo, and open the top few results.
+
+    Returns a list of {title, url, snippet, preview} — `preview` is the start of the
+    actual page for the highest-ranked results, empty for the rest (and for pages that
+    would not load, which is normal and not an error)."""
     from ddgs import DDGS
     max_results = max(1, min(int(max_results), 10))
     out = []
@@ -129,7 +205,10 @@ def web_search(query, max_results=5):
             "title": r.get("title", ""),
             "url":   r.get("href") or r.get("url") or r.get("link", ""),
             "snippet": r.get("body") or r.get("snippet", ""),
+            "preview": "",
         })
+    if SEARCH_PREVIEW_N > 0:
+        _attach_previews(out[:SEARCH_PREVIEW_N])
     return out
 
 def web_fetch(url):
@@ -147,9 +226,14 @@ def web_fetch(url):
             f"{url} is a PDF — web_fetch cannot extract PDF text, so fetching it (or "
             "any other PDF link) will not work. Find an HTML page with the same "
             "information instead: a docs page, spec page, abstract page, or article.")
-    if "html" not in ctype and "xml" not in ctype and resp.text[:100].strip().startswith("{"):
+    # Encoding: when a response has no charset in its Content-Type, requests falls back
+    # to ISO-8859-1 per the old HTTP spec, and every non-ASCII character arrives mangled
+    # — "Ryzen™" reads as "Ryzenâ¢". Hand BeautifulSoup the raw BYTES instead and let it
+    # use the page's own <meta charset>, which is what the browser does.
+    if "html" not in ctype and "xml" not in ctype and resp.content[:100].strip().startswith(b"{"):
+        resp.encoding = resp.encoding or resp.apparent_encoding
         return resp.text[:FETCH_CHARS]  # looks like JSON/plain
-    soup = BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(resp.content, "lxml")
     for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "form", "aside"]):
         tag.decompose()
     title = (soup.title.string.strip() if soup.title and soup.title.string else "")
@@ -233,6 +317,19 @@ TOOL_SPECS = [
             "query": {"type": "string", "description": "the search query"},
             "max_results": {"type": "integer", "description": "how many results, 1-10 (default 5)"},
         }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "more_steps",
+        "description": (
+            "Ask for more research steps when the ones you have are not enough to "
+            "answer properly — typically because the pages you fetched were poor, "
+            "off-topic or contradicted each other. Use it when you know what to try "
+            "next and are only short of room. Do NOT use it to keep looking for "
+            "confirmation of something you have already established."),
+        "parameters": {"type": "object", "properties": {
+            "reason": {"type": "string",
+                       "description": "what went wrong and what you intend to try next"},
+        }, "required": ["reason"]},
     }},
 ]
 
@@ -359,18 +456,24 @@ TOOLS (call one at a time):
 - web_search    -> {"tool":"web_search","args":{"query":"...","max_results":5}}
 - web_fetch     -> {"tool":"web_fetch","args":{"url":"https://..."}}
 - arxiv_search  -> {"tool":"arxiv_search","args":{"query":"...","max_results":5}}
+- more_steps    -> {"tool":"more_steps","args":{"reason":"what went wrong, what you'll try next"}}
 
 HOW TO ACT — first decide where the answer LIVES, then match your effort:
-1. Casual, conversational, or simple questions you already know cold: just
+1. FOLLOW-UPS — the conversation above is yours. When the question refers to
+   something already in it (a table, a list, an answer you wrote), that content
+   IS the source: reuse it exactly as written, keep the user's wording, and do
+   NOT search to re-derive it or to find outside backing for it. Reach for
+   tools only for what the conversation does not already contain.
+2. Casual, conversational, or simple questions you already know cold: just
    answer directly. No tools, no multi-step analysis, no ceremony.
-2. DERIVABLE problems — logic puzzles, math, proofs, code tracing, anything
+3. DERIVABLE problems — logic puzzles, math, proofs, code tracing, anything
    self-contained in the question: the answer lives in the problem, not on the
    web. Solve it in your own reasoning and present the derivation as the
    answer. Do NOT search for confirmation, similar problems, or something to
    cite: your proof IS the source, and a derived answer gets no "Sources:"
    section. Only reach for tools if the problem itself references outside
    facts you don't have.
-3. HYBRID problems — feasibility studies, designs, sizing/budget questions
+4. HYBRID problems — feasibility studies, designs, sizing/budget questions
    that mix derivation with real-world data: do the derivation YOURSELF first
    (set up the budgets and inequalities from the stated constraints), then use
    tools only to fetch the specific numbers your analysis needs (a motor's
@@ -378,19 +481,24 @@ HOW TO ACT — first decide where the answer LIVES, then match your effort:
    a product's marketing claim ("lifts 8 kg") is never a substitute for
    checking the constraints yourself. If a fetched number contradicts your
    physics, distrust it and say so in the answer.
-4. WORLD questions needing current or verifiable facts: use tools. To call one,
+5. WORLD questions needing current or verifiable facts: use tools. To call one,
    reply with ONLY a single JSON object exactly like the forms above, and
    nothing else on that turn. No prose around it. IMPORTANT: writing ABOUT a
    tool call ("I need to search for X", "Use web_search") does NOT call it —
    only the raw JSON object does. If you decide to search, your entire reply
    must BE that JSON.
-5. You will then receive an OBSERVATION with the results. Read it.
-6. For a quick lookup, one good source is enough — web_fetch it rather than
-   trusting a search snippet, then answer.
-7. Save the thorough treatment (several searches from different angles,
+6. You will then receive an OBSERVATION with the results. Read it.
+7. web_search already OPENS the top few results: those come back with "page text
+   (already fetched)" under them, which is the real page, not a snippet. Read
+   that text and answer from it. Do NOT web_fetch a URL whose page text you were
+   already given — that costs a whole extra step and returns what you have. Use
+   web_fetch for the OTHER results (the ones with only a snippet), or to read a
+   previewed page in full when the preview cuts off mid-point.
+   For a quick lookup, one good source is enough.
+8. Save the thorough treatment (several searches from different angles,
    multiple independent sources, cross-checking) for when the user explicitly
    asks for deep research or the stakes clearly demand it.
-8. Write the FINAL ANSWER as normal prose (NOT JSON). If you used web sources,
+9. Write the FINAL ANSWER as normal prose (NOT JSON). If you used web sources,
    cite them inline as [1], [2], ... and list the full URLs under a "Sources:"
    heading; note any disagreements between sources. Plain text and markdown
    only: write math in plain symbols (169 GB ≈ 47 × 3.58 GB), NEVER LaTeX
@@ -406,6 +514,11 @@ RULES:
 - Prefer primary sources (papers, official docs, repos) over blog summaries.
 - Use as many tool calls as the question deserves and no more. When you can
   answer with reasonable confidence, stop and answer.
+- Running out of steps because your sources let you down is not a reason to give
+  a thin answer. If the pages you fetched were paywalled, off-topic, or simply
+  wrong, and you know what to try instead, call more_steps and say what you will
+  try. That is what it is for. It is NOT for hunting more confirmation of
+  something you have already established, or for putting off writing the answer.
 """
 
 # For models driven through Ollama's native tool-calling API. The tool definitions
@@ -420,16 +533,21 @@ work) use the tools rather than guess. Your REASONING is not frozen: problems
 that can be solved by thinking are yours to solve, and no tool can do it for you.
 
 HOW TO ACT — first decide where the answer LIVES, then match your effort:
-1. Casual, conversational, or simple questions you already know cold: just
+1. FOLLOW-UPS — the conversation above is yours. When the question refers to
+   something already in it (a table, a list, an answer you wrote), that content
+   IS the source: reuse it exactly as written, keep the user's wording, and do
+   NOT search to re-derive it or to find outside backing for it. Reach for
+   tools only for what the conversation does not already contain.
+2. Casual, conversational, or simple questions you already know cold: just
    answer directly. No tools, no multi-step analysis, no ceremony.
-2. DERIVABLE problems — logic puzzles, math, proofs, code tracing, anything
+3. DERIVABLE problems — logic puzzles, math, proofs, code tracing, anything
    self-contained in the question: the answer lives in the problem, not on the
    web. Solve it in your own reasoning and present the derivation as the
    answer. Do NOT search for confirmation, similar problems, or something to
    cite: your proof IS the source, and a derived answer gets no "Sources:"
    section. Only reach for tools if the problem itself references outside
    facts you don't have.
-3. HYBRID problems — feasibility studies, designs, sizing/budget questions
+4. HYBRID problems — feasibility studies, designs, sizing/budget questions
    that mix derivation with real-world data: do the derivation YOURSELF first
    (set up the budgets and inequalities from the stated constraints), then use
    tools only to fetch the specific numbers your analysis needs (a motor's
@@ -437,16 +555,21 @@ HOW TO ACT — first decide where the answer LIVES, then match your effort:
    a product's marketing claim ("lifts 8 kg") is never a substitute for
    checking the constraints yourself. If a fetched number contradicts your
    physics, distrust it and say so in the answer.
-4. WORLD questions needing current or verifiable facts: call the tools.
+5. WORLD questions needing current or verifiable facts: call the tools.
    Deciding to search is not searching — actually invoke the tool, don't
    narrate the plan.
-5. Read each tool result before deciding your next step.
-6. For a quick lookup, one good source is enough — web_fetch it rather than
-   trusting a search snippet, then answer.
-7. Save the thorough treatment (several searches from different angles,
+6. Read each tool result before deciding your next step.
+7. web_search already OPENS the top few results: those come back with "page text
+   (already fetched)" under them, which is the real page, not a snippet. Read
+   that text and answer from it. Do NOT web_fetch a URL whose page text you were
+   already given — that costs a whole extra step and returns what you have. Use
+   web_fetch for the OTHER results (the ones with only a snippet), or to read a
+   previewed page in full when the preview cuts off mid-point.
+   For a quick lookup, one good source is enough.
+8. Save the thorough treatment (several searches from different angles,
    multiple independent sources, cross-checking) for when the user explicitly
    asks for deep research or the stakes clearly demand it.
-8. Write the FINAL ANSWER as normal prose. If you used web sources, cite them
+9. Write the FINAL ANSWER as normal prose. If you used web sources, cite them
    inline as [1], [2], ... and list the full URLs under a "Sources:" heading;
    note any disagreements between sources. Plain text and markdown only: write
    math in plain symbols (169 GB ≈ 47 × 3.58 GB), NEVER LaTeX markup
@@ -462,7 +585,13 @@ RULES:
 - Prefer primary sources (papers, official docs, repos) over blog summaries.
 - Use as many tool calls as the question deserves and no more. When you can
   answer with reasonable confidence, stop and answer.
+- Running out of steps because your sources let you down is not a reason to give
+  a thin answer. If the pages you fetched were paywalled, off-topic, or simply
+  wrong, and you know what to try instead, call more_steps and say what you will
+  try. That is what it is for. It is NOT for hunting more confirmation of
+  something you have already established, or for putting off writing the answer.
 """
+
 
 # ========================================================================
 # OLLAMA (streaming, via stdlib — no extra dependency)
@@ -590,7 +719,15 @@ def format_observation(tool, result):
                 lines.append(f"[{i}] {item['title']}\n    {item['url']}\n"
                              f"    authors: {item['authors']}\n    {item['summary']}")
             else:
-                lines.append(f"[{i}] {item['title']}\n    {item['url']}\n    {item['snippet']}")
+                block = f"[{i}] {item['title']}\n    {item['url']}\n    {item['snippet']}"
+                # A previewed result carries the real page, so say so plainly —
+                # otherwise the model treats it as another snippet and fetches the
+                # page it has already been handed, which is the round trip we just
+                # spent a concurrent fetch to avoid.
+                if item.get("preview"):
+                    block += ("\n    --- page text (already fetched, no need to "
+                              f"web_fetch this one) ---\n{item['preview']}")
+                lines.append(block)
         return "\n".join(lines) if lines else "(no results)"
     return str(result)
 
@@ -753,6 +890,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
     searches_in_a_row = 0   # list-tool calls since the last web_fetch (loop detector)
 
     max_steps = steps_for(effort)
+    extensions = 0          # how many times the model has bought itself more room
     step = 0
     wasted = 0              # steps refunded because every tool call in them failed
     try:
@@ -833,10 +971,46 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                 yield {"type": "tool_call", "tool": tool, "label": label}
                 t0 = time.time()
                 try:
+                    if tool == "more_steps":
+                        # Not a research tool — it edits this loop's own budget, so it is
+                        # handled here rather than in TOOLS. Granting costs the step that
+                        # asked, so the net gain is STEP_EXTENSION - 1; that is deliberate,
+                        # since asking should never be entirely free.
+                        why = str(args.get("reason", "")).strip()[:200]
+                        if extensions < MAX_EXTENSIONS:
+                            extensions += 1
+                            max_steps += STEP_EXTENSION
+                            obs = (f"Granted: +{STEP_EXTENSION} steps (now {max_steps} "
+                                   f"total, extension {extensions} of {MAX_EXTENSIONS}). "
+                                   f"Spend them on the plan you just described — a "
+                                   f"different source or a different query, not the same "
+                                   f"one again. Continue.")
+                            yield {"type": "notice",
+                                   "text": f"more steps requested — {why or 'no reason given'}"}
+                            yield {"type": "observation", "tool": tool, "n": STEP_EXTENSION,
+                                   "ok": True, "preview": f"+{STEP_EXTENSION} steps "
+                                                          f"({extensions}/{MAX_EXTENSIONS})"}
+                        else:
+                            obs = (f"Refused: you have already extended {MAX_EXTENSIONS} "
+                                   f"times, which is the limit. Write the best FINAL ANSWER "
+                                   f"you can from what you have, and say plainly which "
+                                   f"parts you could not confirm.")
+                            yield {"type": "observation", "tool": tool, "n": 0, "ok": False,
+                                   "preview": "extension limit reached"}
+                        step_usable = True   # a decision was made; nothing to refund
+                        if came_natively:
+                            messages.append({"role": "tool", "tool_name": tool,
+                                             "content": obs})
+                        else:
+                            messages.append({"role": "user", "content":
+                                             f"OBSERVATION from {tool}:\n{obs}\n\n"
+                                             f"Continue: call another tool (JSON only) or "
+                                             f"write the FINAL ANSWER."})
+                        continue
                     if tool not in TOOLS:
                         # a model inventing e.g. web_find gets a steer, not a bare KeyError
                         raise ValueError(f"unknown tool {tool!r} — the only tools are: "
-                                         + ", ".join(TOOLS))
+                                         + ", ".join(list(TOOLS) + ["more_steps"]))
                     result = TOOLS[tool](args)
                     if isinstance(result, list) and not result:
                         raise UnusableSource(
@@ -854,7 +1028,19 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                             read_domains.add(dom)
                             yield {"type": "source", "url": args.get("url", "")}
                     elif isinstance(result, list):  # remember URLs we could fetch later
-                        unread_urls.extend(it["url"] for it in result if it.get("url"))
+                        # A previewed result was really downloaded and read, so it counts
+                        # as a source: it gets a source event (the UI's clickable list) and
+                        # a read domain (the depth gate). Without this a run that answered
+                        # straight from previews would show no sources at all.
+                        for it in result:
+                            if it.get("preview") and it.get("url"):
+                                dom = urllib.parse.urlparse(it["url"]).netloc
+                                if dom and dom not in read_domains:
+                                    read_domains.add(dom)
+                                    searches_in_a_row = 0
+                                    yield {"type": "source", "url": it["url"]}
+                        unread_urls.extend(it["url"] for it in result
+                                           if it.get("url") and not it.get("preview"))
                         # Loop detector: a model re-searching the same question over and
                         # over (instead of reading or answering) burns minutes for nothing.
                         # After the 3rd search with no page read in between, say so to its
@@ -908,9 +1094,16 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                     left = max_steps - step
                     clock = f"\n\n[progress: research step {step} of {max_steps}"
                     if left <= 3:
+                        # Two exits, stated together on purpose. Telling it only to
+                        # converge is right when it HAS what it needs and wrong when its
+                        # sources fell through — and only the model can tell those apart.
                         clock += (f" — only {left} step(s) remain before the final answer "
-                                  "is forced. Stop opening new leads; converge and land "
-                                  "the answer yourself")
+                                  "is forced. If you have enough, converge and land the "
+                                  "answer yourself")
+                        if extensions < MAX_EXTENSIONS:
+                            clock += (". If instead the pages you drew were poor or "
+                                      "off-topic and you know what to try next, call "
+                                      "more_steps with a reason")
                     clock += "]"
                 messages[-1]["content"] += clock
 

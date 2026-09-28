@@ -21,12 +21,16 @@
     }
   }
   *{box-sizing:border-box}
+  /* [hidden] is only a display:none in the UA sheet, so ANY display rule of ours beats
+     it on specificity and the element stays on screen. The mic is flex and starts
+     hidden, so without this a server without faster-whisper still draws it. */
+  [hidden]{display:none !important}
   html,body{margin:0;height:100%}
   body{background:var(--bg);color:var(--ink);
        font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;
        display:flex;flex-direction:column}
-  header{display:flex;gap:8px;align-items:center;padding:10px 14px;
-         border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+  header{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;
+         padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
   /* a long model name shouldn't be able to push the row into wrapping */
   #model{max-width:200px}
   /* the writing-style block now carries the auto margin, so it sits beside the title
@@ -161,7 +165,41 @@
   /* New chat sits with the title as the only control on the left; its auto margin is
      what pushes the model row to the right edge. The left margin sets the app's name
      apart, so the tagline reads as a caption rather than as a label for the button. */
-  #newchat{margin-left:26px;margin-right:auto}
+  /* Title + New chat sit left; the model controls sit in the true centre of the header.
+     Two grid children across `1fr auto 1fr` does that honestly: the empty third column
+     balances the first, so the middle group is centred on the page rather than on
+     whatever space the title happens to leave over. Auto margins can't achieve that —
+     they only centre within the leftover space, which drifts as the title changes. */
+  #newchat{margin-left:26px}
+  .hdrleft,.hdrmid{display:flex;gap:8px;align-items:center;min-width:0}
+  .hdrmid{justify-self:center}
+  /* Model status. This box runs several LLMs across two runtimes, and the one thing you
+     cannot tell by looking is which of them is holding the RAM — Ollama's own view is
+     blind to llama.cpp. So the header says it continuously: ours, anyone else's, and
+     what is left. The third grid column was already there, empty, balancing the first. */
+  /* overflow:hidden here and min-width:0 on the text are what make the ellipsis work:
+     a nowrap flex item refuses to shrink below its content otherwise, and the line
+     would silently overrun the model controls instead of truncating. */
+  /* NOT justify-self:end — that sizes the item to its content, which then overruns the
+     track to the left and lands on top of the model controls. Stretching it to the
+     track and pushing the content right keeps the width honest, so the clip can bite. */
+  .hdrright{display:flex;justify-content:flex-end;align-items:center;
+            min-width:0;overflow:hidden}
+  .mstate{display:inline-flex;align-items:center;gap:7px;min-width:0;max-width:100%;
+          font-size:12px;color:var(--dim);white-space:nowrap;cursor:default}
+  .mstate .txt{overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .mstate .dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:none}
+  .mstate.live .dot{background:var(--accent);box-shadow:0 0 6px var(--accent)}
+  .mstate.busy .dot{background:var(--warn);box-shadow:0 0 6px var(--warn)}
+  .mstate b{font-weight:600;color:var(--ink)}
+  /* free memory earns colour only when it starts to matter */
+  .mstate .free.tight{color:var(--warn)}
+  .mstate .free.full{color:var(--stop);font-weight:600}
+  /* Below the grid's comfortable width, fall back to one wrapping flex row. */
+  @media (max-width:1100px){
+    header{display:flex;flex-wrap:wrap}
+    .hdrmid{justify-self:auto;flex-wrap:wrap}
+  }
   /* That gap exists to set the tagline apart, so it leaves when the tagline does —
      keeping it would cost a whole wrapped row on a narrow window. Must sit AFTER the
      rule above: a media query adds no specificity, so source order decides. */
@@ -191,12 +229,39 @@
      transcribe; without dictation the text still runs to within 48px of the edge. */
   body.voice textarea{padding-right:80px}
   @media (prefers-reduced-motion:reduce){ #mic.rec{animation:none} }
+  /* Track and knob are shared by every role="switch" in the page, so a second switch
+     cannot quietly drift away from the first. Layout stays per-control. */
+  [role="switch"] .track{position:relative;width:34px;height:19px;border-radius:19px;
+                background:var(--chip);border:1px solid var(--line);
+                transition:background .18s,border-color .18s}
+  [role="switch"] .knob{position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;
+               background:var(--dim);transition:transform .18s,background .18s}
+  [role="switch"]:hover{color:var(--ink)}
+  [role="switch"]:hover .track{border-color:var(--dim)}
+  [role="switch"][aria-checked="true"] .track{background:var(--accent);border-color:transparent}
+  [role="switch"][aria-checked="true"] .knob{background:var(--accent-ink);transform:translateX(15px)}
+  /* Read this answer aloud. Drawn twice per answer — level with the first line and
+     again in the bar at the end — so a long answer never has to be scrolled back to
+     the top to start it. Both are the same control and light up together. */
+  .speakbtn{background:none;border:none;padding:2px 4px;cursor:pointer;color:var(--dim);
+            line-height:0}
+  .speakbtn svg{width:16px;height:16px;fill:currentColor}
+  .speakbtn:hover{color:var(--ink)}
+  .speakbtn.talking{color:var(--accent);animation:speakpulse 1.2s ease-in-out infinite}
+  @keyframes speakpulse{50%{opacity:.45}}
+  @media (prefers-reduced-motion:reduce){ .speakbtn.talking{animation:none} }
+  /* The top one floats, so the first paragraph flows around it instead of running
+     underneath it — no reserved gutter, and nothing moves when it isn't there. */
+  .speakbtn.top{float:right;margin:2px 0 4px 10px}
 </style>
 </head>
 <body>
   <header>
+   <div class="hdrleft">
     <span class="title">research <small>· web-capable LLM</small></span>
     <button id="newchat">New chat</button>
+   </div>
+   <div class="hdrmid">
     <button id="sayhi" title="Warm up the selected model so it's ready — no need to type hi">Say Hi!</button>
     <label><small style="color:var(--dim)">model</small></label>
     <select id="model"></select>
@@ -211,6 +276,11 @@
       <option value="1" selected title="The model's full range. Recommended for gpt-oss: it converges in its own thinking, so clamping sampling only makes it repeat itself.">Creative</option>
     </select>
     <button id="deactivate" title="Unload the selected model from RAM to free memory">Deactivate</button>
+   </div>
+   <div class="hdrright">
+    <span id="mstate" class="mstate" title="checking what is loaded…">
+      <i class="dot"></i><span class="txt">checking memory…</span></span>
+   </div>
   </header>
 
   <div id="convo"><div class="wrap" id="turns"></div></div>
@@ -259,24 +329,28 @@ const turns = $("#turns"), convo = $("#convo");
 let controller = null, liveQuestion = null;
 let switching = false;   // a model is being loaded into RAM; sending must wait for it
 
-// ---- the conversation, kept in localStorage ----
-// Without this the TAB is the conversation: sid was regenerated on every page load,
-// so a reload — or pasting the URL into a second tab — opened a blank page while the
-// real session sat unreachable in the server's memory. Keeping sid + finished turns
-// here lets any tab pick the thread back up. Deliberately client-side: a new tab has
-// to learn the sid from somewhere anyway, and a server "read my history" route would
-// be a second way to pull conversations back out over HTTP, which history.py's whole
-// posture is built to avoid.
+// ---- the conversation, kept per tab in sessionStorage ----
+// One tab is one conversation. sessionStorage is scoped to the tab, so a reload keeps
+// the thread (the sid must survive it, or the session sits unreachable in the server's
+// memory) while a second tab starts its own — which is the point: two tabs are two
+// questions in parallel, not one thread rendered twice. This was localStorage, and
+// that store is shared by every tab of the origin: a new tab replayed the first tab's
+// conversation, and New chat there wiped the others. Deliberately client-side still: a
+// server "read my history" route would be a second way to pull conversations back out
+// over HTTP, which history.py's whole posture is built to avoid.
 const SKEY = "research.session";
+// The old shared copy would otherwise sit in localStorage forever, unread — and it is
+// conversation text, so leaving it behind is the wrong default.
+try{ localStorage.removeItem(SKEY); }catch(e){}
 const KEEP_TURNS = 8;          // mirrors the server's RESEARCH_MAX_HISTORY_TURNS
 function loadStore(){
   try{
-    const s = JSON.parse(localStorage.getItem(SKEY));
+    const s = JSON.parse(sessionStorage.getItem(SKEY));
     if(s && typeof s.sid === "string" && Array.isArray(s.turns)) return s;
   }catch(e){}                  // unparseable/absent: start fresh rather than break
   return null;
 }
-function saveStore(){ try{ localStorage.setItem(SKEY, JSON.stringify(store)); }catch(e){} }
+function saveStore(){ try{ sessionStorage.setItem(SKEY, JSON.stringify(store)); }catch(e){} }
 let store = loadStore() || {sid: crypto.randomUUID(), turns: []};
 let sid = store.sid;
 saveStore();
@@ -348,6 +422,9 @@ async function loadModels(){
     if(d.voice && navigator.mediaDevices?.getUserMedia && window.MediaRecorder){
       $("#mic").hidden=false; document.body.classList.add("voice");
     }
+    // Answers get a speaker button only if the server can actually synthesise; the
+    // class is read by addSpeakButtons, so a machine without Kokoro shows none.
+    if(d.speech) document.body.classList.add("speech");
   }catch(e){ /* offline is fine; server will error clearly on send */ }
 }
 
@@ -374,10 +451,12 @@ function addCopyBar(ansEl, text){
   const b=document.createElement("button"); b.textContent="Copy";
   b.onclick=()=>{ navigator.clipboard.writeText(text); b.textContent="Copied ✓";
                   setTimeout(()=>b.textContent="Copy",1200); };
-  bar.appendChild(b); ansEl.appendChild(bar);
+  bar.appendChild(b);
+  ansEl.appendChild(bar);
+  addSpeakButtons(ansEl, bar, text);   // needs the bar in place to sit at the end of it
 }
 
-// A turn replayed from localStorage: question + answer, no trace. The reasoning
+// A turn replayed from this tab's store: question + answer, no trace. The reasoning
 // steps are deliberately not stored — the server discards that bulk after each turn
 // too (commit_turn), so what the page shows matches what the model still remembers.
 function renderSaved(q, a){
@@ -416,6 +495,11 @@ function newTurn(question){
 function setStatus(ctx, label){   // live one-line status shown while the model works
   if(!ctx.answering) ctx.sum.innerHTML = '<span class="spin">◐</span> ' + label;
 }
+// Reasoning before any search is the model working out what to look for; reasoning
+// after one is it working out what to say. The engine sends the same "thinking" event
+// for both, so the difference is whether a tool has run yet in this turn. If it decides
+// to search again the next tool_call resets the line, so this can't be stuck wrongly.
+const thinkLabel = ctx => ctx.searched ? "finalising the answer…" : "thinking…";
 function setDone(ctx, ok=true){
   ctx.sum.innerHTML = ok ? "✓ reasoning &amp; sources (click to expand)" : "✗ trace";
   ctx.trace.open = false;
@@ -440,6 +524,7 @@ function parkDraft(ctx){
 async function ask(question){
   const model = $("#model").value, effort = $("#effort").value;
   liveQuestion = question;   // so Stop can hand the text back for editing
+  speakStop();               // a new run supersedes whatever is still being read out
   const ctx = newTurn(question);
   // Send is locked during a run, but the textarea stays enabled so the user can
   // draft the next question while the model is still answering.
@@ -450,8 +535,9 @@ async function ask(question){
     const resp = await fetch("/api/ask",{
       method:"POST", headers:{"Content-Type":"application/json"},
       // `restore` lets the server rebuild this session if it has never heard of the
-      // sid — after a server restart the tab still shows the conversation, so the
-      // model must get it back too or the next follow-up answers out of nowhere.
+      // sid — after a server restart (or after the session cache dropped this sid) the
+      // tab still shows the conversation, so the model must get it back too or the
+      // next follow-up answers out of nowhere.
       body: JSON.stringify({q:question, model, effort, sid, temp: Number($("#temp").value),
                             restore: store.turns}),
       signal: controller.signal,
@@ -487,6 +573,7 @@ async function ask(question){
     if(finalText) rememberTurn(question, finalText);   // survive reload / other tabs
     sendMode("send"); runEnded=performance.now();
     controller=null; $("#q").focus();
+    refreshState();    // answering may have pulled the model in — say so straight away
   }
 }
 
@@ -619,20 +706,28 @@ addEventListener("keydown", e=>{
 // readout turns amber off 1.0 because that default is a recommendation, not a whim —
 // gpt-oss is meant to converge in its thinking, and clamping sampling is what produced
 // the repeated-thinking, re-search-the-same-page behaviour the loop detector catches.
+// Kept in sessionStorage, not localStorage: writing style is a property of a CONVERSATION,
+// the same way the transcript is, so a new tab — and New chat — opens at the recommended
+// step rather than inheriting a Precise you picked for one awkward question last week.
+// Reloading inside a tab still keeps your pick, because that is the same conversation.
+// Contrast ACTIVE_KEY below, which stays in localStorage on purpose: which model holds the
+// RAM is a fact about the machine, and every tab needs to agree on it.
 const TEMP_KEY="research.temp", TEMP_DEFAULT="1";
 const tempSel = $("#temp");
 function setWritingStyle(v, remember=true){
   tempSel.value = v;
   // Assigning a value no <option> carries leaves the select blank rather than throwing,
-  // which is the check: a stale localStorage entry from the old four-button strip must
+  // which is the check: a stale stored entry from the old four-button strip must
   // land on the recommended step instead of sending temp:NaN to the model.
   if(!tempSel.value) tempSel.value = TEMP_DEFAULT;
-  if(remember) try{ localStorage.setItem(TEMP_KEY, tempSel.value); }catch(e){}
+  if(remember) try{ sessionStorage.setItem(TEMP_KEY, tempSel.value); }catch(e){}
 }
 tempSel.onchange = () => setWritingStyle(tempSel.value);
-// Restore the last pick; an unknown/absent value falls back to the recommended one.
-setWritingStyle((()=>{ try{ return localStorage.getItem(TEMP_KEY) || TEMP_DEFAULT; }
+// Restore this tab's pick; an unknown/absent value falls back to the recommended one.
+setWritingStyle((()=>{ try{ return sessionStorage.getItem(TEMP_KEY) || TEMP_DEFAULT; }
                      catch(e){ return TEMP_DEFAULT; } })(), false);
+// Sweep the old cross-tab entry, which would otherwise sit in localStorage forever unread.
+try{ localStorage.removeItem(TEMP_KEY); }catch(e){}
 
 // Follow the server's view of which model is loaded. Called on the heartbeat, when
 // another tab broadcasts a switch, and when a question is refused as stale — so a tab
@@ -679,14 +774,27 @@ $("#model").addEventListener("change", async () => {
   try{
     const r = await fetch("/api/switch",{method:"POST",headers:{"Content-Type":"application/json"},
                                          body:JSON.stringify({from:prev, to:next})});
-    if(!r.ok) throw new Error("HTTP "+r.status);
+    if(!r.ok){
+      // 409 is the memory door saying no. Carry the server's reason through verbatim:
+      // "switch failed" would hide the one fact that matters, which is what's holding
+      // the RAM and how much short we are.
+      let msg = "HTTP "+r.status;
+      try{ msg = (await r.json()).error || msg; }catch(e2){}
+      const err = new Error(msg); err.refused = (r.status===409); throw err;
+    }
     currentModel = next;
     broadcastActive(next);        // other tabs update now, not on their next heartbeat
     holdHint(null); flashHint("✓ "+next+" is loaded and ready");
   }catch(e){
     sel.value = prev;    // the switch failed; the selector must not lie about what's live
-    holdHint(null); flashHint("⚠ switch failed — staying on "+prev);
-  }finally{ sel.disabled=false; switching=false; }
+    if(e.refused){
+      // Pin it: this one is worth reading, and 2s is not long enough to read it in.
+      holdHint("⛔ "+e.message);
+      setTimeout(()=>holdHint(null), 15000);
+    }else{
+      holdHint(null); flashHint("⚠ switch failed — staying on "+prev);
+    }
+  }finally{ sel.disabled=false; switching=false; refreshState(); }
 });
 // Shell-style command history: Up/Down cycle through prior questions.
 const history=[]; let hIdx=0, draft="";
@@ -745,7 +853,7 @@ $("#send").onclick=()=>{
   if(controller){
     if(performance.now()-runStarted<400) return;
     const q=liveQuestion;    // read before abort(), which clears the run state
-    controller.abort();
+    controller.abort(); speakStop();
     if(q) reAsk(q);
     return;
   }
@@ -756,9 +864,12 @@ $("#newchat").onclick=()=>{
   // Abort any run in flight: otherwise it keeps generating into the (now cleared)
   // page and holds Send locked until it finishes on its own.
   if(controller) controller.abort();
+  speakStop();
   store={sid:crypto.randomUUID(), turns:[]}; sid=store.sid; saveStore();
+  setWritingStyle(TEMP_DEFAULT);   // a new conversation starts from the recommended step
   turns.innerHTML=""; $("#q").focus(); };
 $("#sayhi").onclick=()=>{ if(controller || switching) return; stick=true; ask("Hi"); };  // warm the model without typing
+
 $("#deactivate").onclick=async()=>{                       // unload the model from RAM on demand
   const m=$("#model").value;
   if(!m || m==="(no models)") return;
@@ -769,6 +880,7 @@ $("#deactivate").onclick=async()=>{                       // unload the model fr
       headers:{"Content-Type":"application/json"},body:JSON.stringify({model:m})});
     btn.textContent = r.ok ? "Unloaded ✓" : "Failed";
   }catch(e){ btn.textContent="Failed"; }
+  refreshState();      // the freed RAM should show in the header immediately
   setTimeout(()=>{ btn.textContent=old; btn.disabled=false; }, 1400);
 };
 $("#q").addEventListener("keydown",e=>{
@@ -821,6 +933,46 @@ addEventListener("pagehide", () => {
 });
 addEventListener("pageshow", ping);
 
+// ---- what is actually holding this machine's RAM ----
+// Ollama is not the whole machine: llama.cpp servers hold memory it cannot see, and a
+// model that "fits" against Ollama's view can still take the desktop down. The header
+// therefore reports the machine, not one runtime — ours, anyone else's, and what's left.
+const GB = b => (b/1073741824).toFixed(1);
+// "Qwen3.8-Flash-Next-UD-Q4_K_XL" is a file name, not a model name: the quantisation
+// suffix is the longest part of the line and the least useful thing on it. The tooltip
+// still carries the full name for when it matters.
+const shortName = n => n.replace(/-(UD-)?(Q\d|IQ\d|F16|BF16)[\w.]*$/i, "");
+function renderState(s){
+  const el = $("#mstate"), sel = $("#model");
+  const mine = s.resident.find(m => m.backend === "ollama" && m.name === s.active);
+  const others = s.resident.filter(m => m !== mine);
+  const free = s.available, need = (s.sizes || {})[sel && sel.value] || 0;
+  const short = need && free < need + s.reserve;      // the selected model wouldn't fit
+  // Order is truncation order: on a narrow header the tail is what gets clipped, so the
+  // two facts you must not lose — our model's state and the memory left — come first.
+  const bits = [`<b>${esc(s.active || "—")}</b> ${mine ? GB(mine.bytes)+" GB in RAM" : "not loaded"}`];
+  bits.push(`<span class="free ${short ? "full" : (free < 12*1073741824 ? "tight" : "")}">`
+            + `${GB(free)} GB free</span>`);
+  for(const o of others) bits.push(`${esc(shortName(o.name))} ${GB(o.bytes)} GB`);
+  el.querySelector(".txt").innerHTML = bits.join(" · ");
+  el.classList.toggle("live", !!mine);
+  el.classList.toggle("busy", typeof switching !== "undefined" && switching);
+  // The one-liner has to abbreviate; the tooltip carries the whole picture.
+  el.title = (s.resident.length
+      ? "resident:\n" + s.resident.map(m => `  ${m.name} — ${GB(m.bytes)} GB (${m.backend})`).join("\n")
+      : "nothing resident")
+    + `\n\n${GB(free)} GB available of ${GB(s.total)} GB`
+    + (need ? `\n${sel.value} needs ${GB(need)} GB + ${GB(s.reserve)} GB reserve`
+              + (short ? " — WILL NOT FIT" : " — fits") : "");
+}
+async function refreshState(){
+  try{
+    const r = await fetch("/api/state");
+    if(r.ok) renderState(await r.json());
+  }catch(e){}   // the header going stale must never break the page
+}
+refreshState(); setInterval(refreshState, 10000);
+
 // The intelligence selector is three cups; clicking one sets the water line. The
 // hidden #effort input carries the value, so ask() reads it exactly as before.
 const effortWrap = document.querySelector(".effortpick");
@@ -831,27 +983,14 @@ document.querySelectorAll(".cup").forEach(b => b.onclick = () => {
 autosize($("#q"));   // settle the box at exactly its resting height, so the first
                      // keystroke can't nudge it by a pixel
 
-// Replay the stored conversation, then keep tabs on the same session in step: the
-// `storage` event fires in every OTHER tab when one of them writes, so an answer
-// finished in one tab shows up in the others. Skipped while this tab is mid-run —
-// its own turn is still streaming into the page and would be interleaved.
-store.turns.forEach(t => renderSaved(t.q, t.a));
-stickToBottom();
-addEventListener("storage", e => {
-  if(e.key !== SKEY) return;
-  const s = loadStore(); if(!s) return;
-  if(s.sid !== sid){                       // another tab pressed New chat
-    store = s; sid = s.sid;
-    if(controller) controller.abort();
-    turns.innerHTML = ""; s.turns.forEach(t => renderSaved(t.q, t.a));
-  }else if(!controller && s.turns.length > store.turns.length){
-    s.turns.slice(store.turns.length).forEach(t => renderSaved(t.q, t.a));
-    store = s;
-  }else{
-    store = s;                             // keep the data, don't touch the view
-  }
-  stickToBottom();
-});
+// Replay this tab's own conversation. No `storage` listener for SKEY any more: it used
+// to mirror finished answers between tabs and follow another tab's New chat, which is
+// exactly the coupling that made every tab show one conversation. Each tab now renders
+// only what it asked. Model switches still cross tabs (ACTIVE_KEY above) — which model
+// holds the RAM is a fact about the machine, not about a conversation.
+// The replay itself is fired at the END of this file, once loadModels() has answered:
+// a restored answer only gets its speaker button if body.speech is already set, and
+// that class arrives with the /api/models handshake.
 
 // ---- dictation: click to start, click to stop, then send it yourself ----
 // Two explicit triggers, no voice-activity detection, nothing that starts on its own.
@@ -1017,7 +1156,231 @@ function dictate(text){
 mic.onclick = () => { recState==="recording" ? micStop() : micStart(); };
 addEventListener("pagehide", micRelease);
 
-loadModels(); $("#q").focus();
+// ---- speaking: a finished answer, read aloud on demand ----
+// Narration, not conversation. The answer is a document — tables, code, links, and
+// steps that arrive in bursts across long searches, sometimes retracted when the model
+// decides to look something up after all. Reading it as it forms means guessing
+// sentence boundaries in half-written markdown and taking back what was already said.
+// So nothing here ever sees a partial answer: you press the speaker on a finished one.
+// (Streaming speech belongs in the voice application, where audio IS the output.)
+const SPEAK_AHEAD = 2;        // sentences synthesised ahead of the one playing
+const speak = {
+  gen:0,                      // invalidates everything in flight, in one assignment
+  pending:[], ready:[],       // text waiting to synthesise · audio waiting to play
+  synthing:false, playing:false, audio:null, abortClip:null,
+};
+let speakOwner = null;        // the button pair of the answer being read, if any
+
+// Abandon everything: what is playing, what is synthesised, what is queued. Bumping
+// gen is what makes it safe — the fetch and the <audio> already in flight check it and
+// bow out, so there is no window where a late clip starts after you asked for silence.
+//
+// It deliberately does NOT clear speak.playing. That flag belongs to the pump below,
+// which is still unwinding; clearing it here would let a second pump start alongside
+// the first and play two answers over each other.
+function speakStop(){
+  speak.gen++;
+  speak.pending.length = 0;
+  speak.ready.forEach(URL.revokeObjectURL);
+  speak.ready.length = 0;
+  if(speak.audio){ speak.audio.pause(); speak.audio.src=""; speak.audio=null; }
+  // pause() fires neither "ended" nor "error", so the pump would wait on this clip
+  // for ever. Release it by hand.
+  if(speak.abortClip) speak.abortClip();
+  if(speakOwner){ speakMark(speakOwner, false); speakOwner = null; }
+}
+
+// Nothing without a letter or digit in it is worth a round trip and a clip: stripping
+// a table or a rule can leave a lone "." or "-", which synthesises to a click.
+const speakWorthSaying = t => /[a-z0-9]/i.test(t || "");
+
+// Synthesis runs AHEAD of playback rather than in step with it: a sentence takes ~1s to
+// synthesise and ~7s to say, so keeping a couple in hand is the difference between
+// continuous speech and a pause at every full stop.
+//
+// Both pumps serve whatever is in the queue NOW; neither is tied to the generation it
+// started in. That is what makes stop-then-immediately-start work — the generation is
+// checked per item, to throw away a clip that arrived too late, never to end the loop.
+// A pump that quit on the generation change would still hold its flag while unwinding,
+// and the guard at the top would then turn away the work that replaced it.
+async function speakSynthLoop(){
+  if(speak.synthing) return;
+  speak.synthing = true;
+  try{
+    while(speak.pending.length){
+      if(speak.ready.length >= SPEAK_AHEAD){ await speakSleep(120); continue; }
+      const gen = speak.gen;
+      const text = speak.pending.shift();
+      let url = null;
+      try{
+        const r = await fetch("/api/speak",{method:"POST",
+          headers:{"Content-Type":"application/json"}, body:JSON.stringify({text})});
+        if(r.ok) url = URL.createObjectURL(await r.blob());
+      }catch(e){ /* one sentence failing must not silence the rest of the answer */ }
+      if(gen !== speak.gen){ if(url) URL.revokeObjectURL(url); continue; }
+      if(url){ speak.ready.push(url); speakPlayLoop(); }
+    }
+  }finally{ speak.synthing = false; }
+}
+
+async function speakPlayLoop(){
+  if(speak.playing) return;
+  speak.playing = true;                       // claimed synchronously, before any await
+  try{
+    // Keep going while sentences are still being synthesised, not just while some are
+    // ready — otherwise playback stops at the first gap and never restarts.
+    while(speak.ready.length || speak.synthing || speak.pending.length){
+      const url = speak.ready.shift();
+      if(!url){ await speakSleep(80); continue; }
+      const gen = speak.gen;
+      try{ await speakClip(url, gen); }
+      finally{ URL.revokeObjectURL(url); }
+    }
+  }finally{ speak.playing = false; }
+}
+
+function speakClip(url, gen){
+  return new Promise(resolve => {
+    if(gen !== speak.gen) return resolve();
+    const a = new Audio(url);
+    speak.audio = a;
+    let over = false;
+    const done = () => {
+      if(over) return;                       // ended and error can both arrive
+      over = true;
+      if(speak.audio === a) speak.audio = null;
+      if(speak.abortClip === done) speak.abortClip = null;
+      resolve();
+    };
+    speak.abortClip = done;                  // speakStop ends the wait through this
+    a.onended = done; a.onerror = done;
+    a.play().catch(() => {
+      // Autoplay refused: the browser wants a gesture it can attribute. Pressing the
+      // speaker IS one, so this is rare — but say so rather than going quietly silent.
+      flashHint("the browser blocked audio — click the page, then try again");
+      done();
+    });
+  });
+}
+const speakSleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Markdown is written to be read with the eyes. Fences, pipes and asterisks have no
+// spoken form, and reading a URL aloud character by character is worse than useless.
+function speakable(md){
+  return (md||"")
+    // Code blocks are skipped in silence rather than announced: they are on the screen
+    // in front of you, and "bash r m dash r f slash tmp" is not speech.
+    .replace(/```[\s\S]*?```/g, "\n\n")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")        // images
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")      // links: keep the words, drop the URL
+    // A table row is unreadable as written — but only the pipes are. The words in the
+    // cells are the answer, so speak them: drop the |---|---| rule, and read every other
+    // row as its cells in order, separated by commas. The header row goes first and
+    // names the columns once, which is what makes the rows after it make sense. Ending
+    // each row with a full stop hands speakSplit a clean break, so one row is one clip.
+    .replace(/^[ \t]*\|(.+)\|[ \t]*$/gm, (_, row) =>
+      /^[\s|:-]+$/.test(row) ? " "
+        : row.split("|").map(c => c.trim().replace(/[.,;:]+$/, "")).filter(Boolean).join(", ") + ".")
+    .replace(/^\s*[-=*_]{3,}\s*$/gm, " ")         // horizontal rules
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")           // headings
+    .replace(/^\s*>\s?/gm, "")                    // block quotes
+    .replace(/^\s*[-*+]\s+/gm, "")                // bullets
+    .replace(/^\s*\d+[.)]\s+/gm, "")              // numbered items
+    .replace(/\*\*([^*]+)\*\*/g, "$1").replace(/__([^_]+)__/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1").replace(/_([^_]+)_/g, "$1")
+    .replace(/【[^】]*】/g, "")                    // gpt-oss's citation tokens
+    .replace(/https?:\/\/\S+/g, " link ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/ +([.,;:!?])/g, "$1")               // the gap a stripped citation leaves
+    .trim();
+}
+
+// Split for synthesis, not for grammar: a sentence ends at .!?… followed by whitespace.
+// Requiring the whitespace is what keeps "3.5 TOPS" and "gpt-oss:120b" in one piece;
+// the abbreviation list catches the handful that would otherwise split mid-thought.
+// Over-splitting only costs a pause between clips, so this errs toward smaller pieces —
+// they synthesise sooner and the first word lands sooner.
+const ABBREV = /\b(?:e\.g|i\.e|etc|vs|approx|Dr|Mr|Mrs|Ms|Prof|Fig|No|St|Jr|Sr)\.$/i;
+function speakSplit(text){
+  const out = []; let start = 0;
+  const re = /[.!?…]+["')\]]?(?=\s)|\n{2,}/g;
+  let m;
+  while((m = re.exec(text))){
+    const end = m.index + m[0].length;
+    const piece = text.slice(start, end);
+    if(ABBREV.test(piece.trimEnd())) continue;   // not a sentence end after all
+    if(piece.trim()) out.push(piece.trim());
+    start = end;
+  }
+  const rest = text.slice(start).trim();
+  if(rest) out.push(rest);                       // a last line with no closing full stop
+  return out;
+}
+
+// ---- the speaker buttons ----
+const SPEAKER_SVG =
+  '<svg viewBox="0 0 24 24" aria-hidden="true">'
+  + '<path d="M4 9.5v5a1 1 0 0 0 1 1h2.6l4.1 3.3a1 1 0 0 0 1.6-.8V5a1 1 0 0 0-1.6-.8L7.6 7.5H5a1 1 0 0 0-1 1z"/>'
+  + '<path d="M16.4 8.8a4.5 4.5 0 0 1 0 6.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>'
+  + '<path d="M18.9 6.1a8 8 0 0 1 0 11.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>'
+  + "</svg>";
+
+function speakMark(pair, on){
+  pair.forEach(b => {
+    b.classList.toggle("talking", on);
+    b.title = on ? "Stop reading" : "Read this answer aloud";
+    b.setAttribute("aria-label", b.title);
+  });
+}
+
+// One control per answer, drawn twice: level with the first line, and again at the end
+// beside Copy. A long answer should not have to be scrolled back to the top to start
+// it, nor to the bottom to stop it — so both light up and both stop it.
+function addSpeakButtons(ansEl, bar, text){
+  if(!document.body.classList.contains("speech")) return;
+  const pair = [];
+  const make = extra => {
+    const b = document.createElement("button");
+    b.className = "speakbtn" + (extra ? " " + extra : "");
+    b.innerHTML = SPEAKER_SVG;
+    b.onclick = () => {
+      const mine = speakOwner === pair;
+      speakStop();               // silences anything else, and clears its mark
+      if(mine) return;           // pressing the one that is talking just stops it
+      speakOwner = pair; speakMark(pair, true);
+      speakAnswer(text).finally(() => {
+        if(speakOwner === pair){ speakMark(pair, false); speakOwner = null; }
+      });
+    };
+    pair.push(b);
+    return b;
+  };
+  ansEl.insertBefore(make("top"), ansEl.firstChild);
+  bar.appendChild(make());
+  speakMark(pair, false);        // sets the title and aria-label
+}
+
+// Say a whole finished answer, in order. Resolves when it has finished OR when
+// something else takes the voice (speakStop bumps the generation).
+async function speakAnswer(text){
+  const gen = speak.gen;
+  speakSplit(speakable(text)).forEach(p => { if(speakWorthSaying(p)) speak.pending.push(p); });
+  speakSynthLoop(); speakPlayLoop();
+  while(gen === speak.gen && (speak.playing || speak.synthing || speak.pending.length))
+    await speakSleep(150);
+}
+
+addEventListener("pagehide", speakStop);
+
+// Replay the stored conversation only after the handshake has landed. Two reasons it
+// has to happen here rather than where the comment above sits: body.speech is set by
+// loadModels(), so an earlier replay draws every restored answer without its speaker
+// button; and SPEAKER_SVG is a const declared further up this file, so a replay during
+// top-level evaluation would sit in its temporal dead zone. loadModels() swallows its
+// own errors, so the conversation still comes back with the server down.
+loadModels().then(() => { store.turns.forEach(t => renderSaved(t.q, t.a)); stickToBottom(); });
+$("#q").focus();
 </script>
 </body>
 </html>

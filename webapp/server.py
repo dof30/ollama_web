@@ -14,6 +14,7 @@ import base64
 import importlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -25,9 +26,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import agent    # noqa: E402  (engine's dependency; held here so we can hot-reload it)
 import engine   # noqa: E402
 import history  # noqa: E402  (write-only recorder; no HTTP route ever reads it)
-# Deliberately NOT hot-reloaded: reloading it would drop the resident whisper model and
-# pay the load again on the next click.
+# Deliberately NOT hot-reloaded: reloading either would drop a resident model (whisper,
+# Kokoro) and pay the load again on the next click.
 import voice    # noqa: E402  (dictation; inert if faster-whisper is absent)
+import speech   # noqa: E402  (speaking;  inert if kokoro-onnx is absent)
 
 # Hot-reload the research code on edit, so a fix on disk is a fix live — matching
 # how index.html is already served fresh each request. Without this, agent.py /
@@ -70,7 +72,11 @@ HOST = os.environ.get("RESEARCH_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("RESEARCH_WEB_PORT", "8765"))
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "gpt-oss:120b-fast")
+# gemma4:26b (~17 GB), not gpt-oss:120b-fast (~61 GB): this box also runs llama.cpp
+# servers that Ollama cannot see, and with one of those resident there is nowhere near
+# 61 GB free. Defaulting to a model that fits is the difference between a slow answer
+# and a frozen machine. Override with RESEARCH_MODEL when the box is otherwise empty.
+DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "gemma4:26b")
 
 # How much request body we will read. Everything but dictation carries a few short
 # fields; a recording is up to ~90s of 16 kHz mono WAV, base64-inflated by a third.
@@ -78,8 +84,17 @@ MAX_BODY = 64 * 1024
 MAX_AUDIO_BODY = 6 * 1024 * 1024
 
 # In-memory conversation store: session id -> messages. Single local user, so a
-# plain dict is fine; restart clears it (like the CLI's /reset).
+# plain dict is fine; restart clears it (like the CLI's /reset). Insertion order is
+# the eviction order — see the cap in /api/ask.
 SESSIONS = {}
+
+# Each TAB is now a session, not each browser, so sids arrive faster than they used to
+# (open four tabs, get four) and nothing here ever deleted one. Cap it and drop the
+# least recently used. Eviction is safe rather than lossy: the tab keeps its own copy
+# of the thread and sends it back as `restore`, which is the same path a tab takes
+# after a server restart. The cap is far above any plausible number of open tabs, so
+# the session a live turn is writing into is never the one evicted.
+MAX_SESSIONS = 40
 
 # sid -> id of the newest turn started for it. Turns can overlap (Stop, then re-ask
 # before the stopped thread has noticed the dead connection), and only the newest one
@@ -106,9 +121,9 @@ ACTIVE_MODEL = DEFAULT_MODEL
 TEMP_MIN = float(os.environ.get("RESEARCH_TEMP_MIN", "0.4"))
 TEMP_MAX = float(os.environ.get("RESEARCH_TEMP_MAX", "1.0"))
 
-# A browser tab outlives this process: it keeps the conversation in localStorage, so
-# after a restart it asks with a sid we have never seen. Rebuild the session from the
-# tab's own copy — otherwise the page shows a conversation the model has no memory of,
+# A browser tab outlives this process: it keeps its own conversation in sessionStorage,
+# so after a restart it asks with a sid we have never seen. Rebuild the session from
+# the tab's own copy — otherwise the page shows a conversation the model has no memory of,
 # and the next follow-up gets answered out of thin air. Bounded on every axis so a
 # crafted payload can't quietly fill the context window.
 RESTORE_TURNS = 8
@@ -161,25 +176,167 @@ def unload_model(name):
     """Drop a model from RAM now. keep_alive=0 unloads immediately; no messages means
     it won't generate. (NOT -1 — that pins RAM forever, and once wedged a model with a
     year-2318 expiry.)"""
+    APP_MODELS.discard(name)   # no longer ours to evict later
     return set_keep_alive(name, 0)
 
 
+# Models this app pulled into RAM. Ollama will not tell us who loaded what, and the
+# voice app on this machine legitimately keeps a model of its own resident — so we
+# remember ours and leave anything we did not load alone. The exception is a model too
+# large to share the box with anything (below), where politeness would just mean a
+# failed load or a swap storm.
+APP_MODELS = set()
+# At or above this, a model gets the machine to itself: qwen3.5:122b is ~81 GB against
+# 121 GB of RAM, so any other 100B-class model resident at the same time does not fit.
+BIG_MODEL_BYTES = int(os.environ.get("RESEARCH_BIG_MODEL_BYTES", 70_000_000_000))
+# Never plan to use the last of the machine's memory: the kernel, the desktop and the
+# browser all still need room, and a load that only just fits is a load that swaps.
+RAM_RESERVE = int(os.environ.get("RESEARCH_RAM_RESERVE", 6_000_000_000))
+
+
+def model_sizes():
+    """name -> on-disk size in bytes, for every installed model."""
+    try:
+        with urllib.request.urlopen(OLLAMA_HOST + "/api/tags", timeout=5) as r:
+            return {m["name"]: m.get("size", 0) for m in json.load(r).get("models", [])}
+    except Exception:
+        return {}
+
+
+# ---------- what is actually holding this machine's RAM ----------
+# Ollama's /api/ps knows only about Ollama. A llama.cpp server is an ordinary process,
+# invisible to it — which is exactly how this app once loaded 61 GB onto a box that was
+# already committed, and froze it. So ask the kernel, not one runtime.
+
+def mem_info():
+    """(total, available) bytes, straight from /proc/meminfo.
+
+    MemAvailable, not MemFree: it is the kernel's own estimate of what a new process
+    can actually get, counting reclaimable cache. MemFree would read as near-zero on a
+    healthy machine and make everything look impossible."""
+    vals = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    vals[key] = int(rest.split()[0]) * 1024
+    except OSError:
+        return 0, 0
+    return vals.get("MemTotal", 0), vals.get("MemAvailable", 0)
+
+
+def llama_servers():
+    """Every llama.cpp server running on this box, with what it is serving and costs.
+
+    Found by walking /proc rather than asking any daemon, because there is no daemon to
+    ask. argv[0] must END in llama-server, so a shell that merely mentions the name in
+    a command line is not mistaken for the real process."""
+    found = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+            if not argv or not argv[0].endswith("llama-server"):
+                continue
+            name = ""
+            if "-m" in argv:
+                path = argv[argv.index("-m") + 1]
+                # "Qwen3-…-00001-of-00004.gguf" is a shard of one model, not a name.
+                name = re.sub(r"-\d{5}-of-\d{5}$", "",
+                              os.path.basename(path).removesuffix(".gguf"))
+            rss = 0
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss = int(line.split()[1]) * 1024
+                        break
+            found.append({"name": name or "llama.cpp server", "bytes": rss,
+                          "backend": "llama.cpp"})
+        except (OSError, IndexError, ValueError):
+            continue          # process exited mid-walk, or is not ours to read
+    return found
+
+
+def machine_state():
+    """Everything the header needs to say what is loaded and what is left."""
+    total, available = mem_info()
+    sizes = model_sizes()
+    resident = [{"name": m, "bytes": sizes.get(m, 0), "backend": "ollama"}
+                for m in loaded_models()] + llama_servers()
+    return {"total": total, "available": available, "active": ACTIVE_MODEL,
+            "resident": resident, "sizes": sizes, "reserve": RAM_RESERVE}
+
+
+def admit(target):
+    """May `target` be pulled into RAM without taking the machine down? (ok, detail)
+
+    Admission control: the check has to happen BEFORE the request that causes the load,
+    because a warning that arrives afterwards is not a guard. Fails closed — an unknown
+    size is a refusal, since permitting it is how you find out the hard way."""
+    _, available = mem_info()
+    if target in loaded_models():
+        return True, {"need": 0, "free": available, "frees": [], "blockers": []}
+    sizes = model_sizes()
+    plan = eviction_plan(target)
+    room = available + sum(sizes.get(m, 0) for m in plan)
+    blockers = [s for s in llama_servers() if s["bytes"] > 0]
+    detail = {"need": sizes.get(target, 0), "free": room, "reserve": RAM_RESERVE,
+              "frees": plan, "blockers": blockers}
+    if not sizes.get(target):
+        detail["why"] = f"{target} is not installed here, so its size is unknown"
+        return False, detail
+    return sizes[target] + RAM_RESERVE <= room, detail
+
+
+def eviction_plan(target):
+    """Which resident Ollama models would have to go for `target` to load.
+
+    Split out from the eviction itself so admission control can ask what a load would
+    cost without performing it — the plan is what makes "will it fit" honest, since
+    the memory these models hold is about to come back."""
+    loaded = [m for m in loaded_models() if m != target]
+    if not loaded:
+        return []
+    takes_whole_box = model_sizes().get(target, 0) >= BIG_MODEL_BYTES
+    return loaded if takes_whole_box else [m for m in loaded if m in APP_MODELS]
+
+
+def free_ram_for(target):
+    """Unload whatever must go before `target` can be resident, and say what went.
+
+    Normally that is only the other models WE loaded — one model per app, but the voice
+    app's model is left alone. For a model at BIG_MODEL_BYTES or above it is everything
+    else on the machine, because nothing else fits alongside it."""
+    gone = []
+    for m in eviction_plan(target):
+        try:
+            unload_model(m)
+            gone.append(m)
+        except Exception:
+            pass          # best effort; Ollama's own timer still bounds it
+        APP_MODELS.discard(m)
+    return gone
+
+
 def switch_model(old, new):
-    """Hand RAM from one model to the next: drop `old`, then pull `new` in.
+    """Make `new` the resident model: free what has to go, then pull it in.
 
     Order matters on a box where two 100B-class models don't fit at once — freeing
-    first means the load isn't racing the old model for memory. `old` is only touched
-    if it is actually resident, since the empty-prompt request that unloads a model
+    first means the load isn't racing the old model for memory. Only models that are
+    actually resident are touched, since the empty-prompt request that unloads a model
     would otherwise *load* one that wasn't there just to expire it. Loading is the
     same empty-message call, so the new model arrives warm without generating a token.
     The long timeout is the point of the whole feature: a 120B cold load is ~30s, and
     a bigger one can take minutes."""
     global ACTIVE_MODEL
-    unloaded = None
-    if old and old != new and old in loaded_models():
-        unload_model(old)
-        unloaded = old
+    unloaded = free_ram_for(new)
     set_keep_alive(new, agent.keep_alive_for(new) or IDLE_KEEP_ALIVE, timeout=600)
+    APP_MODELS.add(new)
     ACTIVE_MODEL = new   # the new single source of truth every tab syncs to
     return {"ok": True, "unloaded": unloaded, "loaded": new, "active": new}
 
@@ -187,8 +344,10 @@ def switch_model(old, new):
 # ---------- tab presence -> how long the workhorse stays warm ----------
 # The 45m sticky keep_alive buys instant answers, but it only earns its ~65 GB while
 # someone is actually there to ask something. So each open tab sends a heartbeat: with
-# at least one tab open the sticky 45m stands; when the last one closes we shorten the
-# timer to the server's normal 5m default. Tabs that vanish without a goodbye beacon
+# at least one tab open the sticky window is renewed on every sweep, so it never runs
+# down under someone who is reading rather than asking; when the last one closes we
+# shorten the timer to the server's normal 5m default. Tabs that vanish without a
+# goodbye beacon
 # (crash, laptop sleep) age out via TAB_TTL — generous, because browsers throttle
 # timers in background tabs, and a hidden tab is still an open tab.
 TAB_TTL = 150.0     # seconds of silence before a tab counts as gone
@@ -208,8 +367,19 @@ def loaded_models():
         return []
 
 
-def apply_presence():
-    """Point sticky models' keep_alive at the current tab situation, on change only.
+def apply_presence(rearm=False):
+    """Point sticky models' keep_alive at the current tab situation.
+
+    With a tab open the sticky window has to keep sliding forward, so `rearm` re-applies
+    it on every sweep rather than only when presence changes. Arming it once was enough
+    to lose the model anyway: the 45m timer started counting at the moment the first tab
+    opened, so reading for longer than that — without asking anything, which is what
+    refreshes it — silently dropped the workhorse under a tab that was still open.
+    Re-arming is deliberately a sliding finite timer and never -1: if this process dies
+    or the box sleeps, nothing renews it and Ollama reclaims the RAM on its own.
+
+    Only the sweep thread passes `rearm` — a heartbeat must not make a blocking Ollama
+    call every 30s just to say the tab is still there.
 
     Only ever touches a model that is ALREADY loaded: the same empty-prompt request
     that sets a timer would otherwise *pull the model into RAM* to do it — the exact
@@ -221,12 +391,15 @@ def apply_presence():
             if now - seen > TAB_TTL:
                 del PRESENCE[tab]
         warm = bool(PRESENCE)
-        if warm == _tabs_warm:
-            return
+        changed = warm != _tabs_warm
         _tabs_warm = warm
+    # Cold is a one-shot: shorten the timer as the last tab goes, then let Ollama's
+    # clock run. Only the warm side needs renewing.
+    if not changed and not (warm and rearm):
+        return
     ka = agent.KEEP_ALIVE_STICKY if warm else IDLE_KEEP_ALIVE
     for name in loaded_models():
-        if name in agent.STICKY_MODELS:
+        if agent.is_sticky(name):
             try:
                 set_keep_alive(name, ka)
             except Exception:
@@ -237,7 +410,7 @@ def _presence_watcher():
     while True:
         time.sleep(TAB_SWEEP)
         try:
-            apply_presence()
+            apply_presence(rearm=True)
         except Exception:
             pass
 
@@ -315,13 +488,18 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/models":
             # "app" marks this as our server so the launcher can find a running
             # instance by probing ports instead of starting a duplicate.
-            # "voice" tells the page whether to draw the mic button at all — this is
-            # already the handshake, so dictation costs no extra round trip.
+            # "voice"/"speech" tell the page whether to draw the mic and the speak
+            # switch at all — this is already the handshake, so neither costs a round
+            # trip, and a machine without the models simply doesn't show the controls.
             self._send(200, json.dumps({"app": "local-research",
                                         "models": list_models(),
                                         "default": DEFAULT_MODEL,
                                         "active": ACTIVE_MODEL,
-                                        "voice": voice.available()}))
+                                        "voice": voice.available(),
+                                        "speech": speech.available()}))
+        elif path == "/api/state":
+            # What is holding RAM right now, across BOTH runtimes, for the header.
+            self._send(200, json.dumps(machine_state()), extra={"Cache-Control": "no-store"})
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -353,6 +531,36 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send(500, json.dumps({"error": f"{type(e).__name__}: {e}"}))
 
+    def _speak(self):
+        """One sentence in, WAV out — the reply to _transcribe.
+
+        The response is raw audio rather than base64-in-JSON: the Content-Type rule
+        that forced that choice for uploads is about REQUEST bodies, so it does not
+        apply here, and the page can hand the blob straight to an <audio> element.
+
+        What is safe to say has already been decided by the page, which is the only
+        place that can tell a finished answer from the model's thinking as it streams.
+        This end just refuses to be handed an essay."""
+        if not speech.available():
+            self._reject(503, "speech is not available on this server")
+            return
+        req = self._read_json()
+        if req is None:
+            return
+        text = (req.get("text") or "").strip()
+        if not text:
+            self._send(400, json.dumps({"error": "nothing to say"}))
+            return
+        try:
+            wav = speech.synth(text)
+        except Exception as e:
+            self._send(500, json.dumps({"error": f"{type(e).__name__}: {e}"}))
+            return
+        if not wav:
+            self._send(400, json.dumps({"error": "nothing to say"}))
+            return
+        self._send(200, wav, "audio/wav", {"Cache-Control": "no-store"})
+
     def do_POST(self):
         if not self._local_ok():
             self._send(403, json.dumps({"error": "forbidden"}))
@@ -367,6 +575,9 @@ class Handler(BaseHTTPRequestHandler):
         hot_reload()  # pick up any edits to agent.py / engine.py before serving
         if self.path == "/api/transcribe":
             self._transcribe()
+            return
+        if self.path == "/api/speak":
+            self._speak()
             return
         if self.path in ("/api/ping", "/api/bye"):
             req = self._read_json()
@@ -405,6 +616,19 @@ class Handler(BaseHTTPRequestHandler):
             new = (req.get("to") or "").strip()
             if not new:
                 self._send(400, json.dumps({"error": "no model"}))
+                return
+            # Ask before loading, not after. This is the door: a model that cannot fit
+            # is refused here, while refusing is still cheap. 409 = "understood, but
+            # not in this state" — the UI shows the reason inline.
+            ok, why = admit(new)
+            if not ok:
+                gib = lambda b: round(b / 2**30, 1)
+                held = ", ".join(f"{b['name']} ({gib(b['bytes'])} GB)" for b in why["blockers"])
+                msg = why.get("why") or (
+                    f"{new} needs {gib(why['need'])} GB and only {gib(why['free'])} GB is free")
+                if held:
+                    msg += f" — {held} is holding memory outside Ollama"
+                self._send(409, json.dumps({"error": msg, "admission": why}))
                 return
             try:
                 self._send(200, json.dumps(switch_model((req.get("from") or "").strip(), new)))
@@ -449,6 +673,9 @@ class Handler(BaseHTTPRequestHandler):
         if model != ACTIVE_MODEL:
             self._send(409, json.dumps({"error": "stale model", "active": ACTIVE_MODEL}))
             return
+        # Answering loads the model if it wasn't resident, so from here it is ours to
+        # evict when the user switches away.
+        APP_MODELS.add(model)
 
         # Claim the session, then work on a private copy. A stopped turn's thread keeps
         # running until its next write fails, so it can still be alive when the next
@@ -456,9 +683,15 @@ class Handler(BaseHTTPRequestHandler):
         # context, and turn_id stops the older one writing back over the newer answer.
         with _session_lock:
             messages = SESSIONS.get(sid)
-            if messages is None:   # unknown sid: a tab from before the last restart
+            if messages is None:   # unknown sid: a new tab, or one from before a restart
                 messages = SESSIONS[sid] = seed_session(req.get("restore"))
+            else:                  # move to the end: asking counts as recently used
+                SESSIONS[sid] = SESSIONS.pop(sid)
             turn_id = TURNS[sid] = TURNS.get(sid, 0) + 1
+            while len(SESSIONS) > MAX_SESSIONS:
+                stale = next(iter(SESSIONS))
+                del SESSIONS[stale]
+                TURNS.pop(stale, None)
         work = engine.start_turn(messages, question)
 
         # Stream events as Server-Sent-Events style frames.
@@ -515,6 +748,10 @@ def adopt_resident_model():
         ACTIVE_MODEL = resident[0]
         print(f"adopting resident model {ACTIVE_MODEL} (default {DEFAULT_MODEL} is not loaded)",
               flush=True)
+    # Whatever we adopt counts as ours from here on, so switching away frees it rather
+    # than leaving it resident beside its replacement.
+    if ACTIVE_MODEL in resident:
+        APP_MODELS.add(ACTIVE_MODEL)
 
 
 def main():
