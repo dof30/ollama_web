@@ -501,8 +501,12 @@ class Handler(BaseHTTPRequestHandler):
             # "voice"/"speech" tell the page whether to draw the mic and the speak
             # switch at all — this is already the handshake, so neither costs a round
             # trip, and a machine without the models simply doesn't show the controls.
+            # "sizes" rides along so the picker can label each model with the RAM it
+            # costs instead of its parameter count. /api/state carries the same map, but
+            # that arrives on a 10s heartbeat and the picker is built once, at boot.
             self._send(200, json.dumps({"app": "local-research",
                                         "models": list_models(),
+                                        "sizes": model_sizes(),
                                         "default": DEFAULT_MODEL,
                                         "active": ACTIVE_MODEL,
                                         "voice": voice.available(),

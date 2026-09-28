@@ -32,7 +32,13 @@
   header{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;
          padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
   /* a long model name shouldn't be able to push the row into wrapping */
-  #model{max-width:200px}
+  /* The one control you hunt for by eye, so it is set a fifth larger than the rest of the
+     header and its rows are given room to breathe — scanning a list of near-identical
+     names is much easier when they are not stacked tight. Firefox honours padding and
+     font-size on <option> inside the dropdown; where a browser ignores them the list just
+     falls back to its native metrics, which is no worse than before. */
+  #model{max-width:270px;font-size:18px}
+  #model option{font-size:18px;padding:7px 10px;line-height:1.7}
   /* the writing-style block now carries the auto margin, so it sits beside the title
      and everything else is pushed to the right edge */
   header .title{font-weight:600}
@@ -403,6 +409,22 @@ function markdown(text){
 
 // ---- models ----
 let currentModel = null;   // what is actually loaded/selected, so a cancelled switch can revert
+// The picker answers one question — who replies to the next message — and a raw tag like
+// "gpt-oss:120b" answers it slowly: all-lowercase names blur together at a glance, and a
+// parameter count says nothing about whether the thing will even fit in RAM. So the name
+// is capitalised the way it is actually spoken, which gives the eye a shape to catch, and
+// the parameter count is traded for the GB it occupies — the number that decides whether
+// you can load it at all. The option's VALUE keeps the exact tag the server expects.
+const UPPERCASE_WORDS = /^(gpt|oss)$/i;
+function modelLabel(name, bytes){
+  const pretty = name.split(":")[0].split("-")
+    .map(w => UPPERCASE_WORDS.test(w) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1))
+    .join("-");
+  // Size unknown (Ollama listed it but couldn't measure it): show the raw tag rather than a
+  // bare name, which could otherwise read identically to another build of the same model.
+  return bytes ? `${pretty} · ${GB(bytes)} GB` : name;
+}
+
 async function loadModels(){
   try{
     const r = await fetch("/api/models"); const d = await r.json();
@@ -410,25 +432,13 @@ async function loadModels(){
     // Select what the SERVER says is active, not our own default: another tab may have
     // switched models since, and this tab must not open showing a model that isn't loaded.
     const active = d.active || d.default;
-    // Qwen gets a group of its own at the bottom. It sees occasional use here, and one flat
-    // alphabetical list kept seating it next to the two models that get reached for daily.
-    // Grouped rather than hidden: still one click away on the day it IS the right tool.
-    const option = name => {
-      const o=document.createElement("option"); o.value=o.textContent=name;
-      if(name===active) o.selected=true; return o;
-    };
-    const qwen = (d.models||[]).filter(n => /^qwen/i.test(n));
-    const rest = (d.models||[]).filter(n => !/^qwen/i.test(n));
-    if(qwen.length && rest.length){
-      [["Everyday", rest], ["Qwen", qwen]].forEach(([label, names]) => {
-        const og=document.createElement("optgroup"); og.label=label;
-        names.forEach(n => og.appendChild(option(n)));
-        sel.appendChild(og);
-      });
-    }else{
-      // Only one kind present — a lone group heading would be noise, so keep it flat.
-      (d.models||[]).forEach(n => sel.appendChild(option(n)));
-    }
+    const sizes = d.sizes || {};
+    (d.models||[]).forEach(name=>{
+      const o=document.createElement("option");
+      o.value=name;                       // the VALUE stays the exact tag the server needs
+      o.textContent=modelLabel(name, sizes[name]);
+      if(name===active) o.selected=true; sel.appendChild(o);
+    });
     if(!d.models || !d.models.length){ const o=document.createElement("option"); o.textContent="(no models)"; sel.appendChild(o); }
     currentModel = sel.value;   // the baseline a switch is measured against
     // The mic exists only if the server can transcribe AND this browser will hand us
