@@ -410,19 +410,15 @@ function markdown(text){
 // ---- models ----
 let currentModel = null;   // what is actually loaded/selected, so a cancelled switch can revert
 // The picker answers one question — who replies to the next message — and a raw tag like
-// "gpt-oss:120b" answers it slowly: all-lowercase names blur together at a glance, and a
-// parameter count says nothing about whether the thing will even fit in RAM. So the name
-// is capitalised the way it is actually spoken, which gives the eye a shape to catch, and
-// the parameter count is traded for the GB it occupies — the number that decides whether
-// you can load it at all. The option's VALUE keeps the exact tag the server expects.
+// "gpt-oss:120b" answers it slowly: all-lowercase names blur into each other at a glance,
+// and the parameter count is noise at the moment of choosing. So the label is the name
+// alone, capitalised the way it is actually spoken, which gives the eye a shape to catch.
+// The option's VALUE keeps the exact tag the server expects.
 const UPPERCASE_WORDS = /^(gpt|oss)$/i;
-function modelLabel(name, bytes){
-  const pretty = name.split(":")[0].split("-")
+function prettyModel(name){
+  return name.split(":")[0].split("-")
     .map(w => UPPERCASE_WORDS.test(w) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1))
     .join("-");
-  // Size unknown (Ollama listed it but couldn't measure it): show the raw tag rather than a
-  // bare name, which could otherwise read identically to another build of the same model.
-  return bytes ? `${pretty} · ${GB(bytes)} GB` : name;
 }
 
 async function loadModels(){
@@ -432,14 +428,18 @@ async function loadModels(){
     // Select what the SERVER says is active, not our own default: another tab may have
     // switched models since, and this tab must not open showing a model that isn't loaded.
     const active = d.active || d.default;
-    const sizes = d.sizes || {};
-    (d.models||[]).forEach(name=>{
+    const names = d.models || [];
+    // Dropping the tag makes two builds of one model (gpt-oss:120b and gpt-oss:20b) read
+    // identically, and two indistinguishable rows would be worse than the tag ever was.
+    // Only a name that collides falls back to the full tag; the rest stay clean.
+    const pretty = names.map(prettyModel);
+    names.forEach((name, i)=>{
       const o=document.createElement("option");
       o.value=name;                       // the VALUE stays the exact tag the server needs
-      o.textContent=modelLabel(name, sizes[name]);
+      o.textContent = pretty.indexOf(pretty[i]) === pretty.lastIndexOf(pretty[i]) ? pretty[i] : name;
       if(name===active) o.selected=true; sel.appendChild(o);
     });
-    if(!d.models || !d.models.length){ const o=document.createElement("option"); o.textContent="(no models)"; sel.appendChild(o); }
+    if(!names.length){ const o=document.createElement("option"); o.textContent="(no models)"; sel.appendChild(o); }
     currentModel = sel.value;   // the baseline a switch is measured against
     // The mic exists only if the server can transcribe AND this browser will hand us
     // audio: getUserMedia is absent outside a secure context, and Firefox can null it

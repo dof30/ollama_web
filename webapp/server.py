@@ -154,13 +154,21 @@ def seed_session(restore):
 # paths read this same list.
 EMBEDDING_NAME = re.compile(r"embed", re.I)
 
+# Models pulled on this box but not wanted in the picker. Matched as name PREFIXES, so
+# "qwen3.6" hides every tag of that family. This only hides — the weights stay on disk and
+# `ollama run` still reaches them; it is about keeping the one control you choose from down
+# to the models you actually choose between.
+HIDDEN_MODELS = tuple(filter(None, (s.strip() for s in os.environ.get(
+    "RESEARCH_HIDE_MODELS", "qwen3.8,qwen3.6").split(","))))
+
 
 def list_models():
     try:
         with urllib.request.urlopen(OLLAMA_HOST + "/api/tags", timeout=5) as r:
             tags = json.load(r)
         return [m["name"] for m in tags.get("models", [])
-                if not EMBEDDING_NAME.search(m["name"])]
+                if not EMBEDDING_NAME.search(m["name"])
+                and not m["name"].startswith(HIDDEN_MODELS)]
     except Exception:
         return []
 
@@ -501,12 +509,8 @@ class Handler(BaseHTTPRequestHandler):
             # "voice"/"speech" tell the page whether to draw the mic and the speak
             # switch at all — this is already the handshake, so neither costs a round
             # trip, and a machine without the models simply doesn't show the controls.
-            # "sizes" rides along so the picker can label each model with the RAM it
-            # costs instead of its parameter count. /api/state carries the same map, but
-            # that arrives on a 10s heartbeat and the picker is built once, at boot.
             self._send(200, json.dumps({"app": "local-research",
                                         "models": list_models(),
-                                        "sizes": model_sizes(),
                                         "default": DEFAULT_MODEL,
                                         "active": ACTIVE_MODEL,
                                         "voice": voice.available(),
