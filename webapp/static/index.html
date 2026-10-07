@@ -360,11 +360,43 @@ function saveStore(){ try{ sessionStorage.setItem(SKEY, JSON.stringify(store)); 
 let store = loadStore() || {sid: crypto.randomUUID(), turns: []};
 let sid = store.sid;
 saveStore();
+// Duplicating a tab copies sessionStorage, so the copy wakes up holding its source's
+// sid — and the two pages were then ONE conversation on the server, each model reading
+// the other page's questions. The server owns the answer to "whose sid is this"; when
+// it says another live tab has it, this tab starts its own thread. The turns it shows
+// stay, and go up as `restore`, so the new thread remembers exactly what is on screen.
+function rotateSid(){ store.sid = crypto.randomUUID(); sid = store.sid; saveStore(); }
 function rememberTurn(q, a){
   store.turns.push({q, a});
   if(store.turns.length > KEEP_TURNS) store.turns = store.turns.slice(-KEEP_TURNS);
   saveStore();
 }
+
+// ---- the tab is named after its thread ----
+// Every tab read "research", which is no help at all once five of them are open on five
+// different threads — the whole point of a session per tab. The first question names the
+// thread: it is what you remember the thread BY, and it is known the moment you ask
+// rather than after an answer comes back, so the tab is labelled while the answer is
+// still streaming. Kept in the store rather than re-derived from turns[0] so a thread
+// whose first answer was stopped or failed still knows its name after a reload.
+const TITLE_MAX = 48;   // a crowded tab strip shows far less; the rest is for hover
+function topicFrom(q){
+  const one = q.replace(/\s+/g, " ").trim();
+  if(one.length <= TITLE_MAX) return one;
+  // Cut on a word boundary, but only if one is near enough the end that we aren't
+  // throwing away most of the title to find it.
+  const cut = one.slice(0, TITLE_MAX), sp = cut.lastIndexOf(" ");
+  return (sp > TITLE_MAX * 0.6 ? cut.slice(0, sp) : cut).replace(/[\s,;:.!?-]+$/, "") + "…";
+}
+// Fall back to the app name: an untitled tab is a thread you haven't asked anything in.
+function applyTitle(){ document.title = store.title || "research"; }
+function nameThread(q){
+  if(store.title) return;             // the first question names it, later ones don't
+  const t = topicFrom(q);
+  if(!t) return;
+  store.title = t; saveStore(); applyTitle();
+}
+applyTitle();   // a reloaded tab wears its name again before anything is painted
 
 // ---- minimal, dependency-free markdown -> safe HTML ----
 // Quotes must be escaped too: inline() builds href="..." attributes out of this
@@ -425,10 +457,11 @@ async function loadModels(){
   try{
     const r = await fetch("/api/models"); const d = await r.json();
     const sel = $("#model"); sel.innerHTML="";
-    // Select what the SERVER says is active, not our own default: another tab may have
-    // switched models since, and this tab must not open showing a model that isn't loaded.
-    const active = d.active || d.default;
+    // This tab's own pick if it has one (a reload keeps it); a new tab starts on the
+    // model used most recently, which is the one most likely to already be in RAM.
     const names = d.models || [];
+    const mine = (()=>{ try{ return sessionStorage.getItem(MODEL_KEY); }catch(e){ return null; } })();
+    const active = names.includes(mine) ? mine : (d.active || d.default);
     // Dropping the tag makes two builds of one model (gpt-oss:120b and gpt-oss:20b) read
     // identically, and two indistinguishable rows would be worse than the tag ever was.
     // Only a name that collides falls back to the full tag; the rest stay clean.
@@ -546,9 +579,10 @@ function parkDraft(ctx){
 }
 
 // ---- consume the SSE stream ----
-async function ask(question){
+async function ask(question, retried=false){
   const model = $("#model").value, effort = $("#effort").value;
   liveQuestion = question;   // so Stop can hand the text back for editing
+  nameThread(question);      // label the tab now, not when the answer lands
   speakStop();               // a new run supersedes whatever is still being read out
   const ctx = newTurn(question);
   // Send is locked during a run, but the textarea stays enabled so the user can
@@ -563,18 +597,18 @@ async function ask(question){
       // sid — after a server restart (or after the session cache dropped this sid) the
       // tab still shows the conversation, so the model must get it back too or the
       // next follow-up answers out of nowhere.
-      body: JSON.stringify({q:question, model, effort, sid, temp: Number($("#temp").value),
-                            restore: store.turns}),
+      body: JSON.stringify({q:question, model, effort, sid, tab: tabId,
+                            temp: Number($("#temp").value), restore: store.turns}),
       signal: controller.signal,
     });
     if(resp.status === 409){
-      // This tab was out of date about which model is loaded. Correct it, and give the
-      // question back to the composer rather than sending it to the wrong model.
+      // Another live tab owns this conversation (this one is its duplicate, and asked
+      // before the first heartbeat could say so). Take a thread of our own and ask again.
       const d = await resp.json().catch(()=>({}));
       ctx.t.remove();
-      adoptActive(d.active, true);
+      if(d.sid_taken && !retried){ rotateSid(); return await ask(question, true); }
       $("#q").value = question; autosize($("#q"));
-      flashHint("another tab switched to "+d.active+" — your question is back in the box");
+      flashHint("⚠ "+(d.error || "refused")+" — your question is back in the box");
       return;
     }
     const reader = resp.body.getReader(); const dec = new TextDecoder();
@@ -675,6 +709,11 @@ function handle(ctx, ev){
       const a=document.createElement("a"); a.href=ev.url; a.target="_blank"; a.rel="noopener";
       a.textContent="• "+ev.url; a.style.display="block"; ctx.srcEl.appendChild(a); break;
     }
+    case "wait":{
+      // Another tab's answer is running on this model. Its turn has to finish first —
+      // two conversations sharing the model's one slot is what wrecked both answers.
+      setStatus(ctx, "⏳ "+ev.text); break;
+    }
     case "notice":{
       const c=document.createElement("span"); c.className="chip warn"; c.textContent="⤴ "+ev.text;
       (ctx.stepEl||ctx.body).appendChild(c); break;
@@ -735,8 +774,8 @@ addEventListener("keydown", e=>{
 // the same way the transcript is, so a new tab — and New chat — opens at the recommended
 // step rather than inheriting a Precise you picked for one awkward question last week.
 // Reloading inside a tab still keeps your pick, because that is the same conversation.
-// Contrast ACTIVE_KEY below, which stays in localStorage on purpose: which model holds the
-// RAM is a fact about the machine, and every tab needs to agree on it.
+// The model pick is per tab too (MODEL_KEY below): models share the machine now, so two
+// tabs can sit on two different models.
 const TEMP_KEY="research.temp", TEMP_DEFAULT="1";
 const tempSel = $("#temp");
 function setWritingStyle(v, remember=true){
@@ -754,51 +793,51 @@ setWritingStyle((()=>{ try{ return sessionStorage.getItem(TEMP_KEY) || TEMP_DEFA
 // Sweep the old cross-tab entry, which would otherwise sit in localStorage forever unread.
 try{ localStorage.removeItem(TEMP_KEY); }catch(e){}
 
-// Follow the server's view of which model is loaded. Called on the heartbeat, when
-// another tab broadcasts a switch, and when a question is refused as stale — so a tab
-// left open while another switched corrects itself instead of asking the wrong model.
-const ACTIVE_KEY="research.active";
-// `force` is for the refused-question path: the run is being abandoned there, so the
-// usual "don't move the selector under a live turn" guard must not block the correction.
-function adoptActive(name, force){
-  const sel=$("#model");
-  if(!name || name===currentModel) return;
-  if(controller && !force) return;                          // mid-run: leave the live turn alone
-  if(![...sel.options].some(o=>o.value===name)) return;     // unknown here; a reload will fix it
-  sel.value=name; currentModel=name;
-  flashHint("model changed elsewhere — now on "+name);
-}
-// Same-browser tabs shouldn't wait for the next heartbeat to find out.
-function broadcastActive(name){
-  try{ localStorage.setItem(ACTIVE_KEY, name+"|"+Date.now()); }catch(e){}
-}
-addEventListener("storage", e=>{
-  if(e.key===ACTIVE_KEY) adoptActive((e.newValue||"").split("|")[0]);
-});
+// Which model answers THIS tab. It used to be one model for every tab, kept in sync
+// through localStorage and the heartbeat, because loading a second model always threw
+// the first out of RAM. Models now share the machine when they fit, so a tab keeps its
+// own pick and other tabs leave it alone.
+const MODEL_KEY="research.model";
+function keepModel(name){ try{ sessionStorage.setItem(MODEL_KEY, name); }catch(e){} }
+// The old cross-tab broadcast entry would otherwise sit in localStorage unread.
+try{ localStorage.removeItem("research.active"); }catch(e){}
 
-// ---- switching models trades one model's RAM for another's ----
-// On this machine two 100B-class models don't fit at once, so picking a different one
-// is not a free menu choice: the old one is dropped and the new one is pulled in (~30s
-// cold, longer for the big ones). That's worth a confirm rather than a surprise.
+// ---- switching models: load beside what fits, ask before deactivating anything ----
+// A model that fits next to what is already resident just loads — muse-glimmer stays
+// up while gpt-oss comes in beside it. Only when the server says something has to go
+// (a model too big to share the machine) is that worth a confirm rather than a surprise.
 $("#model").addEventListener("change", async () => {
   const sel=$("#model"), next=sel.value, prev=currentModel;
-  if(!prev || next===prev) { currentModel = next; return; }
+  if(!prev || next===prev) { currentModel = next; keepModel(next); return; }
   if(controller){          // mid-answer: the running turn is using the current model
     sel.value = prev;
     flashHint("⏳ can't switch models while an answer is streaming");
     return;
   }
-  const ok = await confirmSheet("Switch model?",
-    `<p>This deactivates <span class="name">${esc(prev)}</span>, freeing its RAM, ` +
-    `then activates <span class="name">${esc(next)}</span>.</p>` +
-    `<p>Loading the new model takes ~30s (longer for the largest ones). ` +
-    `Your conversation is kept.</p>`);
-  if(!ok){ sel.value = prev; return; }
+  let plan = {ok:true, frees:[], resident:false};
+  try{
+    const r = await fetch("/api/switch",{method:"POST",headers:{"Content-Type":"application/json"},
+                                         body:JSON.stringify({to:next, dry:true})});
+    if(r.ok) plan = await r.json();
+  }catch(e){}
+  if(plan.resident){        // already in RAM (another tab loaded it): nothing to wait for
+    currentModel = next; keepModel(next); refreshState();
+    flashHint("✓ "+next+" is already loaded"); return;
+  }
+  if(plan.frees && plan.frees.length){
+    const names = plan.frees.map(n => `<span class="name">${esc(n)}</span>`).join(", ");
+    const ok = await confirmSheet("Switch model?",
+      `<p>There isn't room for <span class="name">${esc(next)}</span> beside what is loaded, ` +
+      `so this deactivates ${names}, freeing its RAM — in every tab that uses it.</p>` +
+      `<p>Loading the new model takes ~30s (longer for the largest ones). ` +
+      `Your conversation is kept.</p>`);
+    if(!ok){ sel.value = prev; return; }
+  }
   sel.disabled=true; switching=true;   // send stays locked until the weights are in RAM
   holdHint("⟳ loading "+next+" into memory — send unlocks when it's ready…");
   try{
     const r = await fetch("/api/switch",{method:"POST",headers:{"Content-Type":"application/json"},
-                                         body:JSON.stringify({from:prev, to:next})});
+                                         body:JSON.stringify({to:next})});
     if(!r.ok){
       // 409 is the memory door saying no. Carry the server's reason through verbatim:
       // "switch failed" would hide the one fact that matters, which is what's holding
@@ -807,8 +846,7 @@ $("#model").addEventListener("change", async () => {
       try{ msg = (await r.json()).error || msg; }catch(e2){}
       const err = new Error(msg); err.refused = (r.status===409); throw err;
     }
-    currentModel = next;
-    broadcastActive(next);        // other tabs update now, not on their next heartbeat
+    currentModel = next; keepModel(next);
     holdHint(null); flashHint("✓ "+next+" is loaded and ready");
   }catch(e){
     sel.value = prev;    // the switch failed; the selector must not lie about what's live
@@ -891,6 +929,7 @@ $("#newchat").onclick=()=>{
   if(controller) controller.abort();
   speakStop();
   store={sid:crypto.randomUUID(), turns:[]}; sid=store.sid; saveStore();
+  applyTitle();   // back to the app name until the next question names this thread
   setWritingStyle(TEMP_DEFAULT);   // a new conversation starts from the recommended step
   turns.innerHTML=""; $("#q").focus(); };
 $("#sayhi").onclick=()=>{ if(controller || switching) return; stick=true; ask("Hi"); };  // warm the model without typing
@@ -903,7 +942,8 @@ $("#deactivate").onclick=async()=>{                       // unload the model fr
   try{
     const r=await fetch("/api/unload",{method:"POST",
       headers:{"Content-Type":"application/json"},body:JSON.stringify({model:m})});
-    btn.textContent = r.ok ? "Unloaded ✓" : "Failed";
+    btn.textContent = r.ok ? "Unloaded ✓" : (r.status===409 ? "In use" : "Failed");
+    if(r.status===409) flashHint("⏳ "+((await r.json().catch(()=>({}))).error || "in use elsewhere"));
   }catch(e){ btn.textContent="Failed"; }
   refreshState();      // the freed RAM should show in the header immediately
   setTimeout(()=>{ btn.textContent=old; btn.disabled=false; }, 1400);
@@ -941,13 +981,13 @@ document.addEventListener("keydown", e => {
 // still counts as open, so the heartbeat keeps running in the background.
 const tabId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
 const beat = (path, keepalive) => fetch(path, {method:"POST", keepalive,
-  headers:{"Content-Type":"application/json"}, body:JSON.stringify({tab:tabId})}).catch(()=>{});
-// The heartbeat doubles as the sync channel: its reply says which model the server
-// considers active, so a tab open since before a switch corrects itself.
+  headers:{"Content-Type":"application/json"}, body:JSON.stringify({tab:tabId, sid})}).catch(()=>{});
+// The heartbeat also claims this tab's conversation. A duplicated tab learns on its
+// first beat — before anything can be asked — that its sid belongs to another tab.
 const ping = async () => {
   const r = await beat("/api/ping", false);
   if(!r || !r.ok) return;
-  try{ adoptActive((await r.json()).active); }catch(e){}
+  try{ if((await r.json()).sid_taken){ rotateSid(); beat("/api/ping", false); } }catch(e){}
 };
 ping(); setInterval(ping, 30000);
 // pagehide covers close/navigate/mobile better than beforeunload; sendBeacon survives
@@ -969,16 +1009,20 @@ const GB = b => (b/1073741824).toFixed(1);
 const shortName = n => n.replace(/-(UD-)?(Q\d|IQ\d|F16|BF16)[\w.]*$/i, "");
 function renderState(s){
   const el = $("#mstate"), sel = $("#model");
-  const mine = s.resident.find(m => m.backend === "ollama" && m.name === s.active);
+  const ours = sel && sel.value;     // this tab's model, not the server's last-used one
+  const mine = s.resident.find(m => m.backend === "ollama" && m.name === ours);
   const others = s.resident.filter(m => m !== mine);
   const free = s.available, need = (s.sizes || {})[sel && sel.value] || 0;
   const short = need && free < need + s.reserve;      // the selected model wouldn't fit
   // Order is truncation order: on a narrow header the tail is what gets clipped, so the
   // two facts you must not lose — our model's state and the memory left — come first.
-  const bits = [`<b>${esc(s.active || "—")}</b> ${mine ? GB(mine.bytes)+" GB in RAM" : "not loaded"}`];
+  const busy = s.busy || [];
+  const bits = [`<b>${esc(ours || "—")}</b> ${mine ? GB(mine.bytes)+" GB in RAM" : "not loaded"}`
+                + (busy.includes(ours) && !controller ? " (answering in another tab)" : "")];
   bits.push(`<span class="free ${short ? "full" : (free < 12*1073741824 ? "tight" : "")}">`
             + `${GB(free)} GB free</span>`);
-  for(const o of others) bits.push(`${esc(shortName(o.name))} ${GB(o.bytes)} GB`);
+  for(const o of others) bits.push(`${esc(shortName(o.name))} ${GB(o.bytes)} GB`
+                                    + (busy.includes(o.name) ? " (answering)" : ""));
   el.querySelector(".txt").innerHTML = bits.join(" · ");
   el.classList.toggle("live", !!mine);
   el.classList.toggle("busy", typeof switching !== "undefined" && switching);
@@ -1011,8 +1055,7 @@ autosize($("#q"));   // settle the box at exactly its resting height, so the fir
 // Replay this tab's own conversation. No `storage` listener for SKEY any more: it used
 // to mirror finished answers between tabs and follow another tab's New chat, which is
 // exactly the coupling that made every tab show one conversation. Each tab now renders
-// only what it asked. Model switches still cross tabs (ACTIVE_KEY above) — which model
-// holds the RAM is a fact about the machine, not about a conversation.
+// only what it asked, on its own model.
 // The replay itself is fired at the END of this file, once loadModels() has answered:
 // a restored answer only gets its speaker button if body.speech is already set, and
 // that class arrives with the /api/models handshake.

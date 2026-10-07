@@ -72,11 +72,12 @@ HOST = os.environ.get("RESEARCH_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("RESEARCH_WEB_PORT", "8765"))
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 HERE = os.path.dirname(os.path.abspath(__file__))
-# gemma4:26b (~17 GB), not gpt-oss:120b-fast (~61 GB): this box also runs llama.cpp
-# servers that Ollama cannot see, and with one of those resident there is nowhere near
-# 61 GB free. Defaulting to a model that fits is the difference between a slow answer
-# and a frozen machine. Override with RESEARCH_MODEL when the box is otherwise empty.
-DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "gemma4:26b")
+# muse-glimmer:30b (~17 GB), not gpt-oss:120b (~61 GB): a new tab with nothing loaded
+# opens on this, and its first question pulls it into RAM — 17 GB is a load that fits
+# beside anything, where 61 GB on a busy box is the difference between a slow answer
+# and a frozen machine. (Was gemma4:26b until it was removed from this box.) Override
+# with RESEARCH_MODEL.
+DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "muse-glimmer:30b")
 
 # How much request body we will read. Everything but dictation carries a few short
 # fields; a recording is up to ~90s of 16 kHz mono WAV, base64-inflated by a third.
@@ -109,12 +110,11 @@ _session_lock = threading.Lock()
 # selector leaves it off so effort stays proportional to the question.
 EFFORT_SOURCES = {"high": 0, "medium": 0, "low": 0}
 
-# Which model this server considers ACTIVE — the one whose weights we have committed
-# RAM to. It has to live here rather than in a tab, because a tab only knows what it
-# picked: switch models in one tab and every other tab kept showing the old name and
-# would happily send the next question to it, silently evicting the model you just
-# loaded. A plain string needs no lock (assignment is atomic under the GIL) and every
-# tab learns it from /api/models on load and /api/ping while open.
+# The model most recently loaded or asked — what a NEW tab opens on. It used to be the one
+# model every tab had to agree on, because loading a second model always evicted the
+# first. Now models share the machine when they fit (see eviction_plan), so each tab
+# keeps its own model and this is only a starting point. A plain string needs no lock
+# (assignment is atomic under the GIL).
 ACTIVE_MODEL = DEFAULT_MODEL
 
 # The band the temperature dial is allowed to move in — see the clamp in /api/ask.
@@ -157,18 +157,28 @@ EMBEDDING_NAME = re.compile(r"embed", re.I)
 # Models pulled on this box but not wanted in the picker. Matched as name PREFIXES, so
 # "qwen3.6" hides every tag of that family. This only hides — the weights stay on disk and
 # `ollama run` still reaches them; it is about keeping the one control you choose from down
-# to the models you actually choose between.
+# to the models you actually choose between. qwen3.5 left the service on 2026-10-07: the
+# 122b is outdated beside qwen3.8:27b, and at ~81 GB it was the one model that could not
+# share the machine. What remains (muse-glimmer:30b, gpt-oss:120b) fits side by side.
 HIDDEN_MODELS = tuple(filter(None, (s.strip() for s in os.environ.get(
-    "RESEARCH_HIDE_MODELS", "qwen3.8,qwen3.6").split(","))))
+    "RESEARCH_HIDE_MODELS", "qwen3.5,qwen3.8,qwen3.6").split(","))))
+
+# Ollama 0.40 lists a GGUF adopted from a llama.cpp install under its digest
+# ("llamacpp:6e67eb…") and can list the same tag twice, once per digest. Neither is a
+# model anyone picks by that name, and a picker with two identical "GPT-OSS" rows is
+# worse than either: Ollama answers by NAME, so both rows reach the same weights.
+DIGEST_NAME = re.compile(r":[0-9a-f]{64}$")
 
 
 def list_models():
     try:
         with urllib.request.urlopen(OLLAMA_HOST + "/api/tags", timeout=5) as r:
             tags = json.load(r)
-        return [m["name"] for m in tags.get("models", [])
-                if not EMBEDDING_NAME.search(m["name"])
-                and not m["name"].startswith(HIDDEN_MODELS)]
+        names = [m["name"] for m in tags.get("models", [])
+                 if not EMBEDDING_NAME.search(m["name"])
+                 and not DIGEST_NAME.search(m["name"])
+                 and not m["name"].startswith(HIDDEN_MODELS)]
+        return list(dict.fromkeys(names))   # de-duplicate, keeping Ollama's order
     except Exception:
         return []
 
@@ -244,6 +254,16 @@ def mem_info():
     return vals.get("MemTotal", 0), vals.get("MemAvailable", 0)
 
 
+def _parent_is_ollama(pid):
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            ppid = next(l.split()[1] for l in f if l.startswith("PPid:"))
+        with open(f"/proc/{ppid}/comm") as f:
+            return f.read().strip() == "ollama"
+    except (OSError, StopIteration):
+        return False
+
+
 def llama_servers():
     """Every llama.cpp server running on this box, with what it is serving and costs.
 
@@ -260,6 +280,11 @@ def llama_servers():
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
             if not argv or not argv[0].endswith("llama-server"):
+                continue
+            # Ollama runs its models in llama-server children of its own. Those are
+            # already counted as Ollama models; listing them again here double-counted
+            # the RAM and named Ollama as "holding memory outside Ollama".
+            if _parent_is_ollama(pid):
                 continue
             name = ""
             if "-m" in argv:
@@ -287,7 +312,8 @@ def machine_state():
     resident = [{"name": m, "bytes": sizes.get(m, 0), "backend": "ollama"}
                 for m in loaded_models()] + llama_servers()
     return {"total": total, "available": available, "active": ACTIVE_MODEL,
-            "resident": resident, "sizes": sizes, "reserve": RAM_RESERVE}
+            "resident": resident, "sizes": sizes, "reserve": RAM_RESERVE,
+            "busy": sorted(busy_models())}
 
 
 def admit(target):
@@ -300,38 +326,68 @@ def admit(target):
     if target in loaded_models():
         return True, {"need": 0, "free": available, "frees": [], "blockers": []}
     sizes = model_sizes()
-    plan = eviction_plan(target)
-    room = available + sum(sizes.get(m, 0) for m in plan)
+    plan, room, busy = eviction_plan(target, sizes, available)
     blockers = [s for s in llama_servers() if s["bytes"] > 0]
     detail = {"need": sizes.get(target, 0), "free": room, "reserve": RAM_RESERVE,
               "frees": plan, "blockers": blockers}
     if not sizes.get(target):
         detail["why"] = f"{target} is not installed here, so its size is unknown"
         return False, detail
+    if busy:
+        detail["why"] = (f"{target} would have to unload {', '.join(busy)}, which is "
+                         f"answering in another tab right now — try again when it finishes")
+        return False, detail
     return sizes[target] + RAM_RESERVE <= room, detail
 
 
-def eviction_plan(target):
-    """Which resident Ollama models would have to go for `target` to load.
+# When each model last answered or was loaded, for least-recently-used eviction.
+LAST_USED = {}
 
+
+def eviction_plan(target, sizes=None, available=None):
+    """Which resident Ollama models must go for `target` to load. -> (plan, room, busy)
+
+    `room` is the memory there will be once the plan has run; `busy` is the part of the
+    plan that is answering in some tab and so cannot go (admit() refuses on it).
+
+    Models share the machine whenever they fit. Loading a second model used to evict the
+    first unconditionally — one model per app — which on 119 GB meant a 17 GB
+    muse-glimmer was thrown out to make room for a 61 GB gpt-oss that fitted beside it
+    with 40 GB to spare. Now the rules are:
+      * a model at BIG_MODEL_BYTES or above never shares, in either direction: loading
+        one clears the box, and loading anything else evicts it. qwen3.5:122b (~81 GB,
+        no longer offered in the picker but still on disk) is the case this guards:
+        next to anything it is one long answer away from swapping.
+      * otherwise nothing goes unless the RAM math says it must, and then only models
+        THIS app loaded, least recently used first, just until the target fits.
     Split out from the eviction itself so admission control can ask what a load would
-    cost without performing it — the plan is what makes "will it fit" honest, since
-    the memory these models hold is about to come back."""
-    loaded = [m for m in loaded_models() if m != target]
-    if not loaded:
-        return []
-    takes_whole_box = model_sizes().get(target, 0) >= BIG_MODEL_BYTES
-    return loaded if takes_whole_box else [m for m in loaded if m in APP_MODELS]
+    cost without performing it."""
+    sizes = model_sizes() if sizes is None else sizes
+    if available is None:
+        _, available = mem_info()
+    others = [m for m in loaded_models() if m != target]
+    if sizes.get(target, 0) >= BIG_MODEL_BYTES:
+        plan = others
+    else:
+        plan = [m for m in others if sizes.get(m, 0) >= BIG_MODEL_BYTES]
+    room = available + sum(sizes.get(m, 0) for m in plan)
+    need = sizes.get(target, 0) + RAM_RESERVE
+    busy_now = busy_models()
+    spare = sorted((m for m in others
+                    if m not in plan and m in APP_MODELS and m not in busy_now),
+                   key=lambda m: LAST_USED.get(m, 0))
+    for m in spare:
+        if room >= need:
+            break
+        plan.append(m)
+        room += sizes.get(m, 0)
+    return plan, room, [m for m in plan if m in busy_now]
 
 
 def free_ram_for(target):
-    """Unload whatever must go before `target` can be resident, and say what went.
-
-    Normally that is only the other models WE loaded — one model per app, but the voice
-    app's model is left alone. For a model at BIG_MODEL_BYTES or above it is everything
-    else on the machine, because nothing else fits alongside it."""
+    """Unload whatever eviction_plan says must go before `target` loads; say what went."""
     gone = []
-    for m in eviction_plan(target):
+    for m in eviction_plan(target)[0]:
         try:
             unload_model(m)
             gone.append(m)
@@ -341,22 +397,73 @@ def free_ram_for(target):
     return gone
 
 
-def switch_model(old, new):
-    """Make `new` the resident model: free what has to go, then pull it in.
+# Loads are planned one at a time. Two tabs loading two different models at once would
+# each be admitted against the same free memory, and both would be wrong.
+_load_lock = threading.Lock()
 
-    Order matters on a box where two 100B-class models don't fit at once — freeing
-    first means the load isn't racing the old model for memory. Only models that are
-    actually resident are touched, since the empty-prompt request that unloads a model
-    would otherwise *load* one that wasn't there just to expire it. Loading is the
-    same empty-message call, so the new model arrives warm without generating a token.
-    The long timeout is the point of the whole feature: a 120B cold load is ~30s, and
-    a bigger one can take minutes."""
+
+def ensure_loaded(model):
+    """Make `model` resident if it is not, under admission control. -> (ok, detail)
+
+    On success detail carries "unloaded" (what had to make room); on refusal it is
+    admit()'s detail plus "msg", the sentence to show the user. Loading is the same
+    empty-message call as set_keep_alive, so the model arrives warm without generating a
+    token; the long timeout is the point — a 120B cold load is ~30s, a bigger one minutes.
+    Order matters: freeing first means the load isn't racing the old model for memory."""
     global ACTIVE_MODEL
-    unloaded = free_ram_for(new)
-    set_keep_alive(new, agent.keep_alive_for(new) or IDLE_KEEP_ALIVE, timeout=600)
-    APP_MODELS.add(new)
-    ACTIVE_MODEL = new   # the new single source of truth every tab syncs to
-    return {"ok": True, "unloaded": unloaded, "loaded": new, "active": new}
+    LAST_USED[model] = time.monotonic()
+    # Already resident is the common case and needs no lock: a tab asking holds its
+    # model's turn lock, and eviction never touches a busy model. Without this, asking
+    # a loaded model would queue behind another tab's 30s cold load of a different one.
+    if model in loaded_models():
+        APP_MODELS.add(model)
+        ACTIVE_MODEL = model
+        return True, {"unloaded": []}
+    with _load_lock:
+        if model in loaded_models():
+            APP_MODELS.add(model)
+            ACTIVE_MODEL = model
+            return True, {"unloaded": []}
+        ok, why = admit(model)
+        if not ok:
+            gib = lambda b: round(b / 2**30, 1)
+            held = ", ".join(f"{b['name']} ({gib(b['bytes'])} GB)" for b in why["blockers"])
+            msg = why.get("why") or (
+                f"{model} needs {gib(why['need'])} GB and only {gib(why['free'])} GB is free")
+            if held and not why.get("why"):
+                msg += f" — {held} is holding memory outside Ollama"
+            why["msg"] = msg
+            return False, why
+        unloaded = free_ram_for(model)
+        set_keep_alive(model, agent.keep_alive_for(model) or IDLE_KEEP_ALIVE, timeout=600)
+        APP_MODELS.add(model)
+        ACTIVE_MODEL = model
+        return True, {"unloaded": unloaded}
+
+
+# ---------- one research turn per model at a time ----------
+# Ollama runs each loaded model in ONE runner with ONE context slot (`-np 1`), and a
+# research turn is not one request but a dozen: think, search, read, think again. Two
+# tabs asking the same model at once therefore took turns on that slot step by step,
+# each step throwing out the other conversation's cached context and restoring its own
+# from a checkpoint. That is where two simultaneous questions to muse-glimmer came back
+# with each other's thinking in them and both answers wrecked. Parallel answers were
+# never the goal on this box, so the fix is the plain one: a turn holds its model until
+# it is finished, and a second tab waits — visibly — for the first answer before its
+# own starts. Different models have different runners and still answer side by side.
+_turn_locks = {}
+_turn_locks_guard = threading.Lock()
+
+
+def turn_lock(model):
+    with _turn_locks_guard:
+        return _turn_locks.setdefault(model, threading.Lock())
+
+
+def busy_models():
+    """Models with a research turn in flight right now; never evicted, never unloaded."""
+    with _turn_locks_guard:
+        return {m for m, lock in _turn_locks.items() if lock.locked()}
 
 
 # ---------- tab presence -> how long the workhorse stays warm ----------
@@ -373,8 +480,32 @@ TAB_SWEEP = 30.0    # how often the watcher re-evaluates
 IDLE_KEEP_ALIVE = os.environ.get("RESEARCH_KEEP_ALIVE_IDLE", "5m")
 
 PRESENCE = {}                # tab id -> last heartbeat (monotonic clock)
+# conversation sid -> the tab id that owns it. A tab keeps its sid in sessionStorage, and
+# DUPLICATING a tab (Duplicate tab, Ctrl/middle-click a link to the app) copies
+# sessionStorage, sid and all. Both pages were then one conversation on the server: each
+# page's model read the other page's questions as its own history, and the two turns
+# superseded each other so one answer was silently dropped. The first live tab to use a
+# sid owns it; any other tab is told to start a fresh one (keeping what it shows).
+SID_OWNER = {}
 _presence_lock = threading.Lock()
 _tabs_warm = None            # last applied state: True=some tab, False=none, None=unknown
+
+
+def claim_sid(sid, tab):
+    """May `tab` speak in conversation `sid`? Claims it if nobody live already has.
+
+    A request without a tab id (the CLI, a page cached from before this) claims nothing
+    and is never refused. A reloaded tab gets a new tab id but must keep its sid: its
+    old id said goodbye on pagehide (or ages out of PRESENCE), so the sid is free again."""
+    if not tab or not sid:
+        return True
+    now = time.monotonic()
+    with _presence_lock:
+        owner = SID_OWNER.get(sid)
+        if owner and owner != tab and now - PRESENCE.get(owner, -TAB_TTL * 2) <= TAB_TTL:
+            return False
+        SID_OWNER[sid] = tab
+        return True
 
 
 def loaded_models():
@@ -408,6 +539,9 @@ def apply_presence(rearm=False):
         for tab, seen in list(PRESENCE.items()):
             if now - seen > TAB_TTL:
                 del PRESENCE[tab]
+        for sid, tab in list(SID_OWNER.items()):
+            if tab not in PRESENCE:
+                del SID_OWNER[sid]
         warm = bool(PRESENCE)
         changed = warm != _tabs_warm
         _tabs_warm = warm
@@ -602,16 +736,21 @@ class Handler(BaseHTTPRequestHandler):
             if req is None:
                 return
             tab = str(req.get("tab") or "")[:64]
+            sid = str(req.get("sid") or "")[:64]
             if tab:
                 with _presence_lock:
                     if self.path == "/api/ping":
                         PRESENCE[tab] = time.monotonic()
                     else:
                         PRESENCE.pop(tab, None)
+                        for s_, t_ in list(SID_OWNER.items()):
+                            if t_ == tab:
+                                del SID_OWNER[s_]
             apply_presence()  # react at once when the first tab opens / the last closes
-            # The heartbeat carries the active model back, so a tab that was open when
-            # another one switched corrects itself instead of asking the wrong model.
-            self._send(200, json.dumps({"ok": True, "active": ACTIVE_MODEL}))
+            # A duplicated tab finds out on its very first heartbeat, before it can ask.
+            taken = self.path == "/api/ping" and not claim_sid(sid, tab)
+            self._send(200, json.dumps({"ok": True, "active": ACTIVE_MODEL,
+                                        "sid_taken": taken}))
             return
         if self.path == "/api/unload":
             req = self._read_json()
@@ -620,6 +759,10 @@ class Handler(BaseHTTPRequestHandler):
             name = (req.get("model") or "").strip()
             if not name:
                 self._send(400, json.dumps({"error": "no model"}))
+                return
+            if name in busy_models():
+                self._send(409, json.dumps({"error": f"{name} is answering in another tab "
+                                                     "— unload it when that answer finishes"}))
                 return
             try:
                 unload_model(name)
@@ -635,23 +778,26 @@ class Handler(BaseHTTPRequestHandler):
             if not new:
                 self._send(400, json.dumps({"error": "no model"}))
                 return
+            # `dry` answers "what would this cost?" without loading anything, so the page
+            # only asks for confirmation when a switch really deactivates something.
+            if req.get("dry"):
+                ok, why = admit(new)
+                self._send(200, json.dumps({"ok": ok, "frees": why.get("frees", []),
+                                            "resident": new in loaded_models()}))
+                return
             # Ask before loading, not after. This is the door: a model that cannot fit
             # is refused here, while refusing is still cheap. 409 = "understood, but
             # not in this state" — the UI shows the reason inline.
-            ok, why = admit(new)
-            if not ok:
-                gib = lambda b: round(b / 2**30, 1)
-                held = ", ".join(f"{b['name']} ({gib(b['bytes'])} GB)" for b in why["blockers"])
-                msg = why.get("why") or (
-                    f"{new} needs {gib(why['need'])} GB and only {gib(why['free'])} GB is free")
-                if held:
-                    msg += f" — {held} is holding memory outside Ollama"
-                self._send(409, json.dumps({"error": msg, "admission": why}))
-                return
             try:
-                self._send(200, json.dumps(switch_model((req.get("from") or "").strip(), new)))
+                ok, why = ensure_loaded(new)
             except Exception as e:
                 self._send(502, json.dumps({"error": f"{type(e).__name__}: {e}"}))
+                return
+            if not ok:
+                self._send(409, json.dumps({"error": why["msg"], "admission": why}))
+                return
+            self._send(200, json.dumps({"ok": True, "unloaded": why["unloaded"],
+                                        "loaded": new, "active": new}))
             return
         if self.path != "/api/ask":
             self._send(404, json.dumps({"error": "not found"}))
@@ -683,17 +829,12 @@ class Handler(BaseHTTPRequestHandler):
         if not question:
             self._send(400, json.dumps({"error": "empty question"}))
             return
-        # A question from a tab that is out of date about which model is loaded would
-        # silently evict the active one and load its own — the exact accident switching
-        # models in another tab used to cause. Refuse instead, and say what is actually
-        # active so the tab can correct itself and hand the question back for a re-send.
-        # Changing model is a deliberate, confirmed act now; it can't happen by typing.
-        if model != ACTIVE_MODEL:
-            self._send(409, json.dumps({"error": "stale model", "active": ACTIVE_MODEL}))
+        # One conversation, one tab. A duplicated tab arrives with its source's sid; it
+        # is told to start its own instead of writing into the other page's thread.
+        if not claim_sid(sid, str(req.get("tab") or "")[:64]):
+            self._send(409, json.dumps({"error": "this conversation belongs to another tab",
+                                        "sid_taken": True}))
             return
-        # Answering loads the model if it wasn't resident, so from here it is ours to
-        # evict when the user switches away.
-        APP_MODELS.add(model)
 
         # Claim the session, then work on a private copy. A stopped turn's thread keeps
         # running until its next write fails, so it can still be alive when the next
@@ -718,22 +859,61 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
+
+        def emit(ev):
+            self.wfile.write(("data: " + json.dumps(ev) + "\n\n").encode("utf-8"))
+            self.wfile.flush()
+
+        # Hold this model for the whole turn (see turn_lock). While another tab's answer
+        # is still running on it, say so, and keep writing a comment frame so a page
+        # closed while waiting is noticed and gives up its place instead of running.
+        lock = turn_lock(model)
+        try:
+            if not lock.acquire(blocking=False):
+                # Usually another tab; sometimes this tab's own just-stopped turn, which
+                # lets go at its next write — so the wording names neither.
+                emit({"type": "wait", "text": f"{model} is finishing another answer — yours starts right after"})
+                while not lock.acquire(timeout=5):
+                    self.wfile.write(b": waiting\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        try:
+            self._answer(model, sid, turn_id, messages, work, question, depth, effort,
+                         temperature, emit)
+        finally:
+            lock.release()
+
+    def _answer(self, model, sid, turn_id, messages, work, question, depth, effort,
+                temperature, emit):
+        """Run one research turn on a model this request already holds."""
         final_text = ""
         sources = []
         aborted = False
         t0 = time.time()
         try:
+            # Answering may need the model loaded first — through the same admission
+            # door as a switch, since any tab can now ask any model.
+            ok, why = ensure_loaded(model)
+            if not ok:
+                emit({"type": "error", "text": why["msg"]})
+                emit({"type": "done"})
+                return
             for ev in engine.research_events(model, work, min_sources=depth, effort=effort,
                                              temperature=temperature):
                 if ev.get("type") == "final":
                     final_text = ev.get("text", "")
                 elif ev.get("type") == "source":
                     sources.append(ev.get("url", ""))
-                frame = "data: " + json.dumps(ev) + "\n\n"
-                self.wfile.write(frame.encode("utf-8"))
-                self.wfile.flush()
+                emit(ev)
         except (BrokenPipeError, ConnectionResetError):
             aborted = True  # browser navigated away / stopped the run
+        except Exception as e:
+            aborted = True  # Ollama refused or died mid-load; tell the page if it is there
+            try:
+                emit({"type": "error", "text": f"{type(e).__name__}: {e}"})
+            except Exception:
+                pass
         finally:
             with _session_lock:
                 # Only the newest turn owns this session. A superseded one must not

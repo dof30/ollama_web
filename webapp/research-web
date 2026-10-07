@@ -27,7 +27,11 @@ find_running() {  # echoes the port of an already-running instance, if any
 
 case "$1" in
   --stop)
-    if pkill -f "$SERVER"; then echo "research web UI stopped"; else echo "not running"; fi
+    # Match the server's WHOLE command line — "<python> <server.py>" and nothing else.
+    # A bare `pkill -f "$SERVER"` also killed any shell whose command merely mentioned the
+    # path, e.g. `research-web --stop && research-web` run through `bash -c`, which killed
+    # the very shell that was about to restart it.
+    if pkill -f -- "^[^ ]*python[0-9.]* $SERVER\$"; then echo "research web UI stopped"; else echo "not running"; fi
     exit 0 ;;
   --status)
     PORT=$(find_running) && echo "running at http://127.0.0.1:$PORT" || echo "not running"

@@ -36,7 +36,7 @@ except ImportError:
 
 # ---------- config ----------
 OLLAMA_HOST   = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "gemma4:26b")  # fits beside a llama.cpp server
+DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "muse-glimmer:30b")  # ~17 GB, fits beside anything
 NUM_CTX       = int(os.environ.get("RESEARCH_NUM_CTX", "32768"))  # headroom for deep multi-fetch turns
 MAX_STEPS     = int(os.environ.get("RESEARCH_MAX_STEPS", "12"))
 FETCH_CHARS   = int(os.environ.get("RESEARCH_FETCH_CHARS", "6000"))
