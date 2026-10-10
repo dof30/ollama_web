@@ -277,9 +277,9 @@
     <label><small style="color:var(--dim)">writing style</small></label>
     <select id="temp" autocomplete="off" aria-label="writing style">
       <option value="0.4" title="Sticks closely to the most likely wording. Tightest and most repeatable.">Precise</option>
-      <option value="0.6" title="A little room to vary, still firmly grounded.">Balanced</option>
+      <option value="0.6" selected title="A little room to vary, still firmly grounded. The default.">Balanced</option>
       <option value="0.8" title="Explores more phrasings and angles.">Curious</option>
-      <option value="1" selected title="The model's full range. Recommended for gpt-oss: it converges in its own thinking, so clamping sampling only makes it repeat itself.">Creative</option>
+      <option value="1" title="The model's full range — OpenAI's recommended sampling for gpt-oss. Try it if answers start repeating themselves or re-searching the same pages.">Creative</option>
     </select>
     <button id="deactivate" title="Unload the selected model from RAM to free memory">Deactivate</button>
    </div>
@@ -313,7 +313,8 @@
       </div>
       <div class="effortpick" data-level="medium">
         <!-- A hidden input carries the value so ask() keeps reading #effort as before.
-             autocomplete=off so a reload can't resurrect a stale pick over the default. -->
+             autocomplete=off so the browser's own form restore can't fight the pick the
+             tab keeps in sessionStorage (see setEffort). -->
         <input type="hidden" id="effort" value="medium" autocomplete="off">
         <div class="cups" role="radiogroup" aria-label="intelligence">
           <button type="button" class="cup" data-level="low"
@@ -579,10 +580,12 @@ function parkDraft(ctx){
 }
 
 // ---- consume the SSE stream ----
-async function ask(question, retried=false){
+// warmup: the Say Hi! button. Its "Hi" only loads the model, so it must not name the
+// tab — warming every dictation session that way left a row of tabs all called "Hi".
+async function ask(question, retried=false, warmup=false){
   const model = $("#model").value, effort = $("#effort").value;
   liveQuestion = question;   // so Stop can hand the text back for editing
-  nameThread(question);      // label the tab now, not when the answer lands
+  if(!warmup) nameThread(question);   // label the tab now, not when the answer lands
   speakStop();               // a new run supersedes whatever is still being read out
   const ctx = newTurn(question);
   // Send is locked during a run, but the textarea stays enabled so the user can
@@ -606,7 +609,7 @@ async function ask(question, retried=false){
       // before the first heartbeat could say so). Take a thread of our own and ask again.
       const d = await resp.json().catch(()=>({}));
       ctx.t.remove();
-      if(d.sid_taken && !retried){ rotateSid(); return await ask(question, true); }
+      if(d.sid_taken && !retried){ rotateSid(); return await ask(question, true, warmup); }
       $("#q").value = question; autosize($("#q"));
       flashHint("⚠ "+(d.error || "refused")+" — your question is back in the box");
       return;
@@ -767,27 +770,27 @@ addEventListener("keydown", e=>{
 // ---- temperature ----
 // A per-request sampling knob, so it costs nothing to change: unlike num_ctx it does
 // not evict the loaded model (measured: load_duration flat across 0.2/1.0/1.8). The
-// readout turns amber off 1.0 because that default is a recommendation, not a whim —
-// gpt-oss is meant to converge in its thinking, and clamping sampling is what produced
-// the repeated-thinking, re-search-the-same-page behaviour the loop detector catches.
+// default is Balanced (0.6), kong's pick. OpenAI recommends 1.0 for gpt-oss, and 0.4
+// is what produced the repeated-thinking, re-search-the-same-page behaviour the loop
+// detector catches — so if that comes back at 0.6, Creative is the step to try.
 // Kept in sessionStorage, not localStorage: writing style is a property of a CONVERSATION,
-// the same way the transcript is, so a new tab — and New chat — opens at the recommended
+// the same way the transcript is, so a new tab — and New chat — opens at the default
 // step rather than inheriting a Precise you picked for one awkward question last week.
 // Reloading inside a tab still keeps your pick, because that is the same conversation.
 // The model pick is per tab too (MODEL_KEY below): models share the machine now, so two
 // tabs can sit on two different models.
-const TEMP_KEY="research.temp", TEMP_DEFAULT="1";
+const TEMP_KEY="research.temp", TEMP_DEFAULT="0.6";
 const tempSel = $("#temp");
 function setWritingStyle(v, remember=true){
   tempSel.value = v;
   // Assigning a value no <option> carries leaves the select blank rather than throwing,
   // which is the check: a stale stored entry from the old four-button strip must
-  // land on the recommended step instead of sending temp:NaN to the model.
+  // land on the default step instead of sending temp:NaN to the model.
   if(!tempSel.value) tempSel.value = TEMP_DEFAULT;
   if(remember) try{ sessionStorage.setItem(TEMP_KEY, tempSel.value); }catch(e){}
 }
 tempSel.onchange = () => setWritingStyle(tempSel.value);
-// Restore this tab's pick; an unknown/absent value falls back to the recommended one.
+// Restore this tab's pick; an unknown/absent value falls back to the default one.
 setWritingStyle((()=>{ try{ return sessionStorage.getItem(TEMP_KEY) || TEMP_DEFAULT; }
                      catch(e){ return TEMP_DEFAULT; } })(), false);
 // Sweep the old cross-tab entry, which would otherwise sit in localStorage forever unread.
@@ -930,9 +933,10 @@ $("#newchat").onclick=()=>{
   speakStop();
   store={sid:crypto.randomUUID(), turns:[]}; sid=store.sid; saveStore();
   applyTitle();   // back to the app name until the next question names this thread
-  setWritingStyle(TEMP_DEFAULT);   // a new conversation starts from the recommended step
+  setWritingStyle(TEMP_DEFAULT);   // a new conversation starts from the default step
+  setEffort(EFFORT_DEFAULT);       // ...and the default effort, so the pair always match
   turns.innerHTML=""; $("#q").focus(); };
-$("#sayhi").onclick=()=>{ if(controller || switching) return; stick=true; ask("Hi"); };  // warm the model without typing
+$("#sayhi").onclick=()=>{ if(controller || switching) return; stick=true; ask("Hi", false, true); };  // warm the model without typing
 
 $("#deactivate").onclick=async()=>{                       // unload the model from RAM on demand
   const m=$("#model").value;
@@ -1044,11 +1048,21 @@ refreshState(); setInterval(refreshState, 10000);
 
 // The intelligence selector is three cups; clicking one sets the water line. The
 // hidden #effort input carries the value, so ask() reads it exactly as before.
+// Effort is a property of the conversation, same as writing style, and remembered the
+// same way: per tab in sessionStorage, so a reload keeps it and New chat resets it.
+// The two used to disagree — a reload reset effort but kept the style, New chat reset
+// the style but kept effort — so after either one the pair no longer matched.
+const EFFORT_KEY="research.effort", EFFORT_DEFAULT="medium";
 const effortWrap = document.querySelector(".effortpick");
-document.querySelectorAll(".cup").forEach(b => b.onclick = () => {
-  $("#effort").value = b.dataset.level;
-  effortWrap.dataset.level = b.dataset.level;
-});
+function setEffort(v, remember=true){
+  if(!["low","medium","high"].includes(v)) v = EFFORT_DEFAULT;
+  $("#effort").value = v;
+  effortWrap.dataset.level = v;
+  if(remember) try{ sessionStorage.setItem(EFFORT_KEY, v); }catch(e){}
+}
+document.querySelectorAll(".cup").forEach(b => b.onclick = () => setEffort(b.dataset.level));
+setEffort((()=>{ try{ return sessionStorage.getItem(EFFORT_KEY) || EFFORT_DEFAULT; }
+               catch(e){ return EFFORT_DEFAULT; } })(), false);
 autosize($("#q"));   // settle the box at exactly its resting height, so the first
                      // keystroke can't nudge it by a pixel
 
