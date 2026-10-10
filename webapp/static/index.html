@@ -74,6 +74,13 @@
   .chip.tool{color:var(--accent)}
   .chip.warn{color:var(--warn)}
   .chip.err{color:#c0392b}
+  /* ask_user options: one button per reading, wide enough to hold a description */
+  .askopts{display:flex;flex-direction:column;align-items:flex-start;gap:6px;margin:10px 0 4px}
+  .askopts button{text-align:left;max-width:100%;white-space:normal;font:inherit;cursor:pointer;
+        background:var(--chip);color:var(--ink);border:1px solid var(--line);border-radius:8px;
+        padding:6px 10px}
+  .askopts button:hover,.askopts button.picked{border-color:var(--accent)}
+  .askopts button.picked{color:var(--accent)}
   .src a{color:var(--link);text-decoration:none;word-break:break-all}
   .src a:hover{text-decoration:underline}
   .answer{margin-top:12px}
@@ -277,9 +284,9 @@
     <label><small style="color:var(--dim)">writing style</small></label>
     <select id="temp" autocomplete="off" aria-label="writing style">
       <option value="0.4" title="Sticks closely to the most likely wording. Tightest and most repeatable.">Precise</option>
-      <option value="0.6" selected title="A little room to vary, still firmly grounded. The default.">Balanced</option>
+      <option value="0.6" title="A little room to vary, still firmly grounded.">Balanced</option>
       <option value="0.8" title="Explores more phrasings and angles.">Curious</option>
-      <option value="1" title="The model's full range — OpenAI's recommended sampling for gpt-oss. Try it if answers start repeating themselves or re-searching the same pages.">Creative</option>
+      <option value="1" selected title="The model's full range — OpenAI's recommended sampling for gpt-oss, and the default.">Creative</option>
     </select>
     <button id="deactivate" title="Unload the selected model from RAM to free memory">Deactivate</button>
    </div>
@@ -505,6 +512,27 @@ convo.addEventListener("scroll", () => {
 function scrollDown(){ if(stick){ convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop; } }
 function stickToBottom(){ stick = true; convo.scrollTop = convo.scrollHeight; lastTop = convo.scrollTop; }
 
+// The model asked which thing you meant (ask_user). Each option is a button that sends
+// itself as your reply — the conversation then carries on as a normal follow-up. A
+// draft already in the box is put back afterwards rather than lost.
+function addAskButtons(ansEl, opts){
+  const box=document.createElement("div"); box.className="askopts";
+  opts.forEach(raw=>{
+    // Plain text in a button, so drop the *emphasis* markers models put round titles.
+    const o=raw.replace(/\*+/g,"");
+    const b=document.createElement("button"); b.textContent=o;
+    b.onclick=()=>{
+      if(controller || switching){ flashHint("⏳ wait for the current answer to finish"); return; }
+      box.querySelectorAll("button").forEach(x=>x.classList.remove("picked"));
+      b.classList.add("picked");
+      const keep=$("#q").value; $("#q").value=o; send();
+      $("#q").value=keep; autosize($("#q"));
+    };
+    box.appendChild(b);
+  });
+  ansEl.appendChild(box);
+}
+
 function addCopyBar(ansEl, text){
   const bar=document.createElement("div"); bar.className="answerbar";
   const b=document.createElement("button"); b.textContent="Copy";
@@ -721,8 +749,15 @@ function handle(ctx, ev){
       const c=document.createElement("span"); c.className="chip warn"; c.textContent="⤴ "+ev.text;
       (ctx.stepEl||ctx.body).appendChild(c); break;
     }
+    case "ask":{
+      // Arrives just before the final: remember the options so the final can draw
+      // them as buttons rather than as the bullet list its text carries.
+      ctx.askQ = ev.question; ctx.askOpts = ev.options || []; break;
+    }
     case "final":{
-      ctx.ans.innerHTML = markdown(ev.text);
+      const opts = ctx.askOpts || [];
+      ctx.ans.innerHTML = markdown(opts.length ? ctx.askQ : ev.text);
+      if(opts.length) addAskButtons(ctx.ans, opts);
       addCopyBar(ctx.ans, ev.text);
       setDone(ctx,true); return ev.text;
     }
@@ -770,16 +805,18 @@ addEventListener("keydown", e=>{
 // ---- temperature ----
 // A per-request sampling knob, so it costs nothing to change: unlike num_ctx it does
 // not evict the loaded model (measured: load_duration flat across 0.2/1.0/1.8). The
-// default is Balanced (0.6), kong's pick. OpenAI recommends 1.0 for gpt-oss, and 0.4
-// is what produced the repeated-thinking, re-search-the-same-page behaviour the loop
-// detector catches — so if that comes back at 0.6, Creative is the step to try.
+// default is Creative (1.0), OpenAI's recommendation for gpt-oss. Balanced (0.6) was the
+// default for one day (2026-10-10) until a test settled it: on a vague question, gpt-oss
+// at medium effort found the show the user meant 3 of 3 times at 1.0, against 2 of 3
+// at 0.6 and 0 of 3 at 0.8. And 0.4 is what produced the
+// repeated-thinking, re-search-the-same-page behaviour the loop detector catches.
 // Kept in sessionStorage, not localStorage: writing style is a property of a CONVERSATION,
 // the same way the transcript is, so a new tab — and New chat — opens at the default
 // step rather than inheriting a Precise you picked for one awkward question last week.
 // Reloading inside a tab still keeps your pick, because that is the same conversation.
 // The model pick is per tab too (MODEL_KEY below): models share the machine now, so two
 // tabs can sit on two different models.
-const TEMP_KEY="research.temp", TEMP_DEFAULT="0.6";
+const TEMP_KEY="research.temp", TEMP_DEFAULT="1";
 const tempSel = $("#temp");
 function setWritingStyle(v, remember=true){
   tempSel.value = v;

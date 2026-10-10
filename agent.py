@@ -331,6 +331,26 @@ TOOL_SPECS = [
                        "description": "what went wrong and what you intend to try next"},
         }, "required": ["reason"]},
     }},
+    {"type": "function", "function": {
+        "name": "ask_user",
+        "description": (
+            "Ask the user which thing they mean, when their words fit several different "
+            "things (shows, films, products, people, versions) and the answers differ. "
+            "Search first so the options are real, and give each option its short answer "
+            "when you have it — then asking costs the user nothing: they see every answer "
+            "and pick the one they meant. This ENDS your turn. A question with one obvious "
+            "meaning gets a plain answer instead."),
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string",
+                         "description": "one short question, e.g. 'Which one did you mean?'"},
+            "options": {"type": "array", "items": {"type": "string"},
+                        "description": (
+                            "2-5 options, each ONE plain string. Describe each by what the user would RECOGNISE "
+                            "(format, who was in it, setting, years), not only by its name "
+                            "— people often ask precisely because they forgot the name. "
+                            "Add the short answer for that option if you already have it.")},
+        }, "required": ["question", "options"]},
+    }},
 ]
 
 _TOOLS_CAP = {}  # model name -> bool, probed once per process
@@ -403,16 +423,29 @@ def date_stamp():
             "search queries about the present should use the current year]")
 
 
+# The ask-back rule lost to habit the same way the date did. With it only in the
+# system prompt, 0 of 10 answers to a vague question ("the Jeremy Clarkson show",
+# "the Steve Jobs movie") asked which one the user meant: the model never thinks it
+# "cannot tell" — it picks the popular reading and feels sure. So the reminder rides
+# on the question too, worded on what the words COULD mean rather than on whether
+# the model feels unsure.
+ASK_BACK_STAMP = ("\n[if these words could point at more than one thing — several "
+                  "shows, films, products or people fit them — search to find the real "
+                  "candidates, then call ask_user even if one is more popular: describe "
+                  "each option by what the user would recognise, not only its name, and "
+                  "give each its short answer; one obvious meaning just gets the answer]")
+
+
 def stamp_current_question(messages):
-    """Append today's date to the question being answered. Only the live turn
-    carries a stamp: it is applied to the turn's own working copy, and the session
-    keeps the clean question, so stamps never pile up in history. Idempotent in case
-    of a double call."""
+    """Append today's date and the ask-back reminder to the question being answered.
+    Only the live turn carries a stamp: it is applied to the turn's own working copy,
+    and the session keeps the clean question, so stamps never pile up in history.
+    Idempotent in case of a double call."""
     if not messages or messages[-1].get("role") != "user":
         return
     if DATE_STAMP_PREFIX in messages[-1]["content"]:
         return
-    messages[-1]["content"] += date_stamp()
+    messages[-1]["content"] += date_stamp() + ASK_BACK_STAMP
 
 
 DEEP_BRIEF_PREFIX = "\n\n[DEEP RESEARCH MODE"
@@ -457,6 +490,7 @@ TOOLS (call one at a time):
 - web_fetch     -> {"tool":"web_fetch","args":{"url":"https://..."}}
 - arxiv_search  -> {"tool":"arxiv_search","args":{"query":"...","max_results":5}}
 - more_steps    -> {"tool":"more_steps","args":{"reason":"what went wrong, what you'll try next"}}
+- ask_user      -> {"tool":"ask_user","args":{"question":"Which one did you mean?","options":["...","..."]}}
 
 HOW TO ACT — first decide where the answer LIVES, then match your effort:
 1. FOLLOW-UPS — the conversation above is yours. When the question refers to
@@ -519,11 +553,21 @@ RULES:
 - Use as many tool calls as the question deserves and no more. When you can
   answer with reasonable confidence, stop and answer.
 - When a question could mean more than one thing (several shows, products,
-  people or versions fit the words), do not silently pick one. Lead with the
-  reading that matches the user's exact words most literally, and give each
-  other plausible reading a line of its own. A candidate your research turned
-  up belongs in the answer, not only in your reasoning — the user cannot see
-  what you weighed and dropped.
+  people or versions fit the words), do not silently pick one. Find out what
+  the candidates ARE: search the subject broadly (a person's whole career, a
+  product's whole line-up), not only the one reading you guessed. Then lead
+  with the reading that matches the user's exact words most literally, and
+  give each other plausible reading a line of its own. A candidate your
+  research turned up belongs in the answer, not only in your reasoning — the
+  user cannot see what you weighed and dropped.
+- If your research shows more than one plausible reading, call ask_user
+  instead of answering — even when one reading is more popular, because the
+  user may mean the other. Describe each option by what the user would
+  recognise — the format, who was in it, the setting, the years — not just its
+  title (people often ask because they forgot the name), and give each its
+  short answer, so asking costs them nothing. Never claim to know what they
+  meant ("the show you're thinking of", "most likely you mean") when you are
+  guessing. A question with one obvious meaning gets a plain answer.
 - Running out of steps because your sources let you down is not a reason to give
   a thin answer. If the pages you fetched were paywalled, off-topic, or simply
   wrong, and you know what to try instead, call more_steps and say what you will
@@ -600,11 +644,21 @@ RULES:
 - Use as many tool calls as the question deserves and no more. When you can
   answer with reasonable confidence, stop and answer.
 - When a question could mean more than one thing (several shows, products,
-  people or versions fit the words), do not silently pick one. Lead with the
-  reading that matches the user's exact words most literally, and give each
-  other plausible reading a line of its own. A candidate your research turned
-  up belongs in the answer, not only in your reasoning — the user cannot see
-  what you weighed and dropped.
+  people or versions fit the words), do not silently pick one. Find out what
+  the candidates ARE: search the subject broadly (a person's whole career, a
+  product's whole line-up), not only the one reading you guessed. Then lead
+  with the reading that matches the user's exact words most literally, and
+  give each other plausible reading a line of its own. A candidate your
+  research turned up belongs in the answer, not only in your reasoning — the
+  user cannot see what you weighed and dropped.
+- If your research shows more than one plausible reading, call ask_user
+  instead of answering — even when one reading is more popular, because the
+  user may mean the other. Describe each option by what the user would
+  recognise — the format, who was in it, the setting, the years — not just its
+  title (people often ask because they forgot the name), and give each its
+  short answer, so asking costs them nothing. Never claim to know what they
+  meant ("the show you're thinking of", "most likely you mean") when you are
+  guessing. A question with one obvious meaning gets a plain answer.
 - Running out of steps because your sources let you down is not a reason to give
   a thin answer. If the pages you fetched were paywalled, off-topic, or simply
   wrong, and you know what to try instead, call more_steps and say what you will
@@ -848,18 +902,52 @@ SYNTH_FROM_KNOWLEDGE = (
     "you need to search. Answer the question directly from your own knowledge, as "
     "prose. If you are not fully certain, say so in one short line at the end.")
 
+def _option_text(opt):
+    """One ask_user option as display text. The schema asks for strings, but gpt-oss
+    often sends objects instead — {"label": ..., "description": ..., "short_answer": ...}
+    — which used to reach the page as a Python dict repr. Label first, then the rest."""
+    if isinstance(opt, dict):
+        keys = ("label", "title", "name", "option")
+        label = next((str(opt[k]).strip() for k in keys if opt.get(k)), "")
+        rest = [str(v).strip() for k, v in opt.items() if v and k not in keys]
+        opt = " — ".join(x for x in [label] + rest if x)
+    return str(opt).strip(" -•\t")
+
+
+SYNTH_RETRY = (
+    "You wrote no answer — only private reasoning, which the user cannot see. No "
+    "tools exist any more. Write the FINAL ANSWER now, as prose, from what you have.")
+SYNTH_GAVE_UP = (
+    "I ran out of research steps before I could write an answer. Try asking again "
+    "— medium effort usually lands it — or narrow the question a little.")
+
+
 def _synthesis(model, messages, instruction=SYNTH_FROM_EVIDENCE, effort=None, temperature=None):
     """Force a written answer: stream it as answer chunks, then end with a `final`
     event carrying the whole text. No `tools` are passed here, so in native mode
-    the model cannot call anything even if it wants to — prose is the only exit."""
+    the model cannot call anything even if it wants to — prose is the only exit.
+
+    It can still leave the content channel EMPTY: at the end of a long high-effort
+    run gpt-oss keeps planning its next search in its reasoning ("Let's find the Top
+    Gear page."), finds no tool to call, and stops. This used to fall back to showing
+    that reasoning as the answer — the user got a page of the model talking to itself,
+    quoting the question stamp back as "a note the user included". Now: one retry at
+    low effort (less room to plan, more pressure to write), then an honest one-liner.
+    Raw reasoning is never the answer."""
     messages.append({"role": "user", "content": instruction})
-    content = thinking = ""
-    for ev in _stream_turn(model, messages, effort=effort, temperature=temperature):
-        if "_turn" in ev:
-            content, thinking, _ = ev["_turn"]
-        else:
-            yield ev
-    yield {"type": "final", "text": tidy_answer((content or thinking).strip())}
+    content = ""
+    for attempt in range(2):
+        for ev in _stream_turn(model, messages, effort=effort if attempt == 0 else "low",
+                               temperature=temperature):
+            if "_turn" in ev:
+                content = ev["_turn"][0]
+            else:
+                yield ev
+        if content.strip():
+            break
+        yield {"type": "notice", "text": "no answer written — asking it to write one"}
+        messages.append({"role": "user", "content": SYNTH_RETRY})
+    yield {"type": "final", "text": tidy_answer(content.strip()) or SYNTH_GAVE_UP}
 
 
 def effort_for(min_sources):
@@ -984,6 +1072,27 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                 yield {"type": "done"}
                 return
 
+            # --- a clarifying question ends the turn: the user answers it, not a tool ---
+            # Like Claude Code's clarification prompt: when the words fit several things,
+            # asking IS the action. The question becomes this turn's answer, so it is kept
+            # in the conversation (and history) and the user's pick lands as a follow-up
+            # to it; the `ask` event lets the page offer the options as buttons. Research
+            # calls batched alongside it are dropped — the model has decided it needs the
+            # user before going any further.
+            ask = next((a for t, a in calls if t == "ask_user"), None)
+            if ask is not None:
+                question = str(ask.get("question") or "").strip() or "Which one did you mean?"
+                options = ask.get("options") or []
+                if isinstance(options, str):          # a lenient in-band call may flatten it
+                    options = options.splitlines()
+                options = [t for t in (_option_text(o) for o in options) if t][:6]
+                yield {"type": "tool_call", "tool": "ask_user", "label": question}
+                yield {"type": "ask", "question": question, "options": options}
+                yield {"type": "final", "text": tidy_answer(
+                    question + "".join(f"\n- {o}" for o in options))}
+                yield {"type": "done"}
+                return
+
             # --- tools were requested (a native model may batch several per turn) ---
             step_usable = False   # did anything in this step actually come back readable?
             for call_idx, (tool, args) in enumerate(calls):
@@ -1030,7 +1139,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                     if tool not in TOOLS:
                         # a model inventing e.g. web_find gets a steer, not a bare KeyError
                         raise ValueError(f"unknown tool {tool!r} — the only tools are: "
-                                         + ", ".join(list(TOOLS) + ["more_steps"]))
+                                         + ", ".join(list(TOOLS) + ["more_steps", "ask_user"]))
                     result = TOOLS[tool](args)
                     if isinstance(result, list) and not result:
                         raise UnusableSource(
