@@ -4,14 +4,46 @@
     {
       "name": "research-web",
       "runtimeExecutable": "/home/kong/miniforge3/bin/python3",
-      "runtimeArgs": ["/home/kong/Local_LLM_web/webapp/server.py"],
+      "runtimeArgs": [
+        "/home/kong/Local_LLM_web/webapp/server.py"
+      ],
       "port": 8765
     },
     {
       "name": "research-web-preview",
       "runtimeExecutable": "env",
-      "runtimeArgs": ["RESEARCH_WEB_PORT=8790", "/home/kong/miniforge3/bin/python3", "/home/kong/Local_LLM_web/webapp/server.py"],
+      "runtimeArgs": [
+        "RESEARCH_WEB_PORT=8790",
+        "/home/kong/miniforge3/bin/python3",
+        "/home/kong/Local_LLM_web/webapp/server.py"
+      ],
       "port": 8790
+    },
+    {
+      "name": "ollama-web2",
+      "runtimeExecutable": "/home/kong/miniforge3/bin/python3",
+      "runtimeArgs": [
+        "/home/kong/ollama_web2/app/server.py"
+      ],
+      "port": 8795
+    },
+    {
+      "name": "slot3-web",
+      "runtimeExecutable": "/home/kong/miniforge3/bin/python3",
+      "runtimeArgs": [
+        "/home/kong/Local_LLM_web_3slot/webapp/server.py"
+      ],
+      "port": 8820
+    },
+    {
+      "name": "qwen-web-test",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "RESEARCH_WEB_PORT=8806",
+        "/home/kong/miniforge3/bin/python3",
+        "/home/kong/Local_Qwen_web/webapp/server.py"
+      ],
+      "port": 8806
     }
   ]
 }

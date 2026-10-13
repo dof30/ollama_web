@@ -64,6 +64,23 @@
         list-style:none;display:flex;gap:8px;align-items:center}
   details.trace>summary::-webkit-details-marker{display:none}
   details.trace>summary .spin{display:inline-block}
+  details.trace>summary .stepcount{margin-left:auto;color:var(--dim);font-size:12px;
+        font-weight:600;letter-spacing:.03em;white-space:nowrap}
+  /* The plan: how the model read the question and the parts it will answer, visible
+     without opening the trace, with a bar measured against its own estimate. */
+  .plan{margin:10px 0 0;border:1px solid var(--line);border-radius:10px;background:var(--panel);
+        padding:8px 12px;font-size:13px}
+  .plan .reading{color:var(--dim);margin-bottom:4px}
+  .plan .reading b{color:var(--ink);font-weight:600}
+  .plan ul{list-style:none;margin:0;padding:0}
+  .plan li{display:flex;gap:8px;align-items:baseline;padding:1px 0}
+  .plan li .pm{width:1.1em;text-align:center;flex:none;color:var(--dim)}
+  .plan li .how{margin-left:auto;padding-left:8px;color:var(--dim);font-size:12px;white-space:nowrap}
+  .plan li.done .pm{color:var(--accent)}
+  .plan li.not_found .pm,.plan li.not_found .how,.plan li.unconfirmed .how{color:var(--warn)}
+  .planbar{height:3px;background:var(--line);border-radius:2px;margin-top:8px;overflow:hidden}
+  .planbar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .4s}
+  .planbar.over>i{background:var(--warn)}
   .tracebody{padding:6px 12px 12px;font-size:13px;color:var(--ink);
         border-top:1px solid var(--line)}
   .step{margin-top:8px}
@@ -89,6 +106,8 @@
   .answer ul,.answer ol{margin:.4em 0 .4em 1.3em;padding:0}
   .answer code{background:var(--chip);padding:1px 5px;border-radius:5px;font-size:.9em}
   .answer pre{background:var(--chip);padding:10px;border-radius:8px;overflow-x:auto}
+  .answer pre code{background:none;padding:0;border-radius:0}
+  .answer td pre{margin:0;padding:6px 8px}
   .answer a{color:var(--link)}
   .answer table{border-collapse:collapse;margin:.7em 0;width:100%;font-size:.95em;
         display:block;overflow-x:auto}
@@ -411,13 +430,31 @@ applyTitle();   // a reloaded tab wears its name again before anything is painte
 // text, and an unescaped " in a model-written URL would break out of the
 // attribute and become live script (the URLs come from fetched web pages).
 function esc(s){return s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+// A model writing a command into a table cell cannot use real line breaks there, so it
+// sometimes collapses a whole fenced block into one span, escapes and all:
+// ``bash\nhuggingface-cli download x \\\n --include "a/*"\n``. A language tag glued to
+// a literal \n is that shape, so unfold it back into the block it was meant to be.
+function codeSpan(body){
+  const m = body.match(/^([a-z][\w+-]*)\\n([\s\S]*)$/i);
+  if(m){
+    const code = m[2].replace(/\\(["\\n])/g, (_, c) => c === "n" ? "\n" : c).replace(/\n+$/, "");
+    return `<pre><code>${esc(code)}</code></pre>`;
+  }
+  return `<code>${esc(body.trim())}</code>`;
+}
 function inline(s){
+  // Code spans come out first, so nothing inside them is read as bold, italics or a
+  // link (a URL or a * in a command is just text). Any run of backticks opens a span
+  // and the same-length run closes it — ``x`` is how markdown quotes code containing `.
+  const codes = [];
+  s = s.replace(/(`+)(?!`)([\s\S]+?)(?<!`)\1(?!`)/g, (_, tick, body) => {
+    codes.push(codeSpan(body)); return `\u0000${codes.length - 1}\u0000`;
+  });
   s = esc(s);
-  s = s.replace(/`([^`]+)`/g,"<code>$1</code>");
   s = s.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
   s = s.replace(/(^|[^*])\*([^*\n]+)\*/g,"$1<em>$2</em>");   // italics, after bold
-  s = s.replace(/(https?:\/\/[^\s<)\]]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');
-  return s;
+  s = s.replace(/(https?:\/\/[^\s<)\]\u0000]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');
+  return s.replace(/\u0000(\d+)\u0000/g, (_, n) => codes[n]);
 }
 function markdown(text){
   const lines = text.split("\n"); let html="", list=null, i=0;
@@ -426,6 +463,17 @@ function markdown(text){
   const cells = s => s.replace(/^\s*\|/,"").replace(/\|\s*$/,"").split("|").map(x=>x.trim());
   while(i < lines.length){
     const line = lines[i].replace(/\s+$/,"");
+    // Fenced code block: everything up to the closing fence is shown verbatim as one
+    // block. Without this each command line became its own paragraph, and a "# comment"
+    // inside it became a heading. An unclosed fence (still streaming) runs to the end.
+    const fence = line.match(/^\s*(`{3,}|~{3,})/);
+    if(fence){
+      closeList();
+      const close = fence[1][0].repeat(3), body = [];
+      for(i++; i < lines.length && !lines[i].trim().startsWith(close); i++) body.push(lines[i]);
+      i++;   // step over the closing fence
+      html += `<pre><code>${esc(body.join("\n"))}</code></pre>`; continue;
+    }
     // GFM table: a header row of pipes followed by a |---|---| separator
     if(line.includes("|") && i+1 < lines.length && isSep(lines[i+1])){
       closeList();
@@ -454,8 +502,15 @@ let currentModel = null;   // what is actually loaded/selected, so a cancelled s
 // and the parameter count is noise at the moment of choosing. So the label is the name
 // alone, capitalised the way it is actually spoken, which gives the eye a shape to catch.
 // The option's VALUE keeps the exact tag the server expects.
+// Two tags whose size is part of the name you'd say out loud. Stripping ":27b" leaves
+// "Qwen3.8", which names the FAMILY — and the family is precisely what this picker does
+// not offer (server.py keeps one build of it and hides the rest), so the short label would
+// promise a choice that isn't there. Keyed by exact tag: another build has to earn its own
+// entry rather than inherit this one.
+const MODEL_LABELS = {"qwen3.8:27b": "Qwen3.8 27b"};
 const UPPERCASE_WORDS = /^(gpt|oss)$/i;
 function prettyModel(name){
+  if(MODEL_LABELS[name]) return MODEL_LABELS[name];
   return name.split(":")[0].split("-")
     .map(w => UPPERCASE_WORDS.test(w) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1))
     .join("-");
@@ -491,6 +546,14 @@ async function loadModels(){
     // Answers get a speaker button only if the server can actually synthesise; the
     // class is read by addSpeakButtons, so a machine without Kokoro shows none.
     if(d.speech) document.body.classList.add("speech");
+    // Hovering a cup tells its step budget. The model can buy more itself (more_steps),
+    // so the ceiling it can reach is said too; both numbers come from the server.
+    if(d.steps) document.querySelectorAll(".cup").forEach(c => {
+      const n = d.steps[c.dataset.level]; if(!n) return;
+      const [ext, times] = d.extension || [0, 0];
+      c.title = c.title.split(" · ")[0] + ` · up to ${n} research steps`
+              + (ext*times ? ` (the model can extend to ${n + ext*times} if sources let it down)` : "");
+    });
   }catch(e){ /* offline is fine; server will error clearly on send */ }
 }
 
@@ -576,11 +639,77 @@ function newTurn(question){
   turns.appendChild(t); scrollDown();
   return {t, trace, sum, body, ans, stream,
           stepEl:null, thinkEl:null, srcEl:null, stepBuf:"", loadTimer:null,
-          answering:false, ansLive:null, lastStep:null};
+          answering:false, ansLive:null, lastStep:null, stepCount:"", label:"thinking…",
+          plan:null, planEl:null, afterPlan:false, curStep:0, turns:0,
+          t0:performance.now(), tick:null};
+}
+
+// ---- progress: elapsed time, and steps/ETA against the model's own plan ----
+// "step 3 of 12" said nothing: 12 is a ceiling, not a forecast. With a plan the line
+// reads "step 3 · ~5 expected · 1:42 · ~1:10 left"; without one, step and clock only.
+const clockFmt = ms => { const s=Math.round(ms/1000); return Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); };
+function progressText(ctx){
+  const el = performance.now()-ctx.t0;
+  let s = ctx.curStep ? "step "+ctx.curStep : "";
+  if(ctx.plan){
+    const exp = ctx.plan.expected;
+    s += " · ~"+exp+" expected";
+    if(ctx.curStep > exp) s += " · past plan";
+    else if(ctx.turns >= 2){
+      // Average model turn so far (planning and retries are turns too), times the
+      // research steps still planned plus the turn that writes the answer.
+      const per = el/ctx.turns, left = (exp-ctx.curStep) + 1;
+      s += " · "+clockFmt(el)+" · ~"+clockFmt(per*left)+" left";
+      return s;
+    }
+  }
+  return (s ? s+" · " : "") + clockFmt(el);
+}
+function paintProgress(ctx){
+  ctx.stepCount = progressText(ctx);
+  setStatus(ctx, ctx.label);
+  if(ctx.planEl && ctx.plan){
+    const bar = ctx.planEl.querySelector(".planbar");
+    const exp = Math.max(1, ctx.plan.expected + 1);       // +1: writing the answer
+    bar.firstChild.style.width = Math.min(100, 100*ctx.curStep/exp)+"%";
+    bar.classList.toggle("over", ctx.curStep > ctx.plan.expected);
+  }
+}
+function startClock(ctx){ ctx.tick = setInterval(()=>paintProgress(ctx), 1000); }
+function stopClock(ctx){
+  if(ctx.tick){ clearInterval(ctx.tick); ctx.tick=null; }
+  const took = '<span class="stepcount">'+clockFmt(performance.now()-ctx.t0)+'</span>';
+  if(!ctx.sum.querySelector(".stepcount")) ctx.sum.insertAdjacentHTML("beforeend", took);
+  if(ctx.planEl){ const bar=ctx.planEl.querySelector(".planbar"); bar.firstChild.style.width="100%"; }
+}
+function renderPlan(ctx){
+  const p = ctx.plan;
+  if(!ctx.planEl){
+    ctx.planEl = document.createElement("div"); ctx.planEl.className="plan";
+    ctx.t.insertBefore(ctx.planEl, ctx.trace);
+  }
+  const mark = x => x.status==="done" ? "✓" : x.status==="not_found" ? "✗" : x.status==="unconfirmed" ? "–" : x.status==="answered" ? "•"
+                  : x.how==="know" ? "◇" : x.how==="ask" ? "?" : "○";
+  const how = x => x.how==="know" ? "from knowledge" : x.how==="ask" ? "will ask you"
+                  : x.status==="done" ? "found" : x.status==="not_found" ? "not found"
+                  : x.status==="unconfirmed" ? "no source read — from memory"
+                  : x.status==="answered" ? "answered · see sources"
+                  : "search · ~"+x.steps+" step"+(x.steps===1?"":"s");
+  ctx.planEl.innerHTML =
+      (p.reading ? '<div class="reading"><b>Reading:</b> '+esc(p.reading)+'</div>' : "")
+    + "<ul>"+p.parts.map(x => '<li class="'+x.status+'"><span class="pm">'+mark(x)+'</span>'
+        + '<span class="pt">'+esc(x.part)+'</span><span class="how">'+how(x)+'</span></li>').join("")+"</ul>"
+    + '<div class="planbar" title="research steps against the plan · hard limit '+(p.limit||"")+'"><i></i></div>';
+  paintProgress(ctx);
 }
 
 function setStatus(ctx, label){   // live one-line status shown while the model works
-  if(!ctx.answering) ctx.sum.innerHTML = '<span class="spin">◐</span> ' + label;
+  ctx.label = label;
+  if(ctx.answering) return;
+  // The current step, mirrored from the trace onto the right of the line, so progress
+  // shows without expanding it.
+  ctx.sum.innerHTML = '<span class="spin">◐</span> ' + label
+    + (ctx.stepCount ? '<span class="stepcount">'+ctx.stepCount+'</span>' : '');
 }
 // Reasoning before any search is the model working out what to look for; reasoning
 // after one is it working out what to say. The engine sends the same "thinking" event
@@ -615,7 +744,7 @@ async function ask(question, retried=false, warmup=false){
   liveQuestion = question;   // so Stop can hand the text back for editing
   if(!warmup) nameThread(question);   // label the tab now, not when the answer lands
   speakStop();               // a new run supersedes whatever is still being read out
-  const ctx = newTurn(question);
+  const ctx = newTurn(question); startClock(ctx);
   // Send is locked during a run, but the textarea stays enabled so the user can
   // draft the next question while the model is still answering.
   sendMode("stop"); runStarted=performance.now();
@@ -659,7 +788,7 @@ async function ask(question, retried=false, warmup=false){
   }catch(e){
     if(e.name!=="AbortError"){ ctx.stream.textContent = "connection error: "+e.message; }
   }finally{
-    clearLoad(ctx);
+    clearLoad(ctx); stopClock(ctx);
     if(finalText) rememberTurn(question, finalText);   // survive reload / other tabs
     sendMode("send"); runEnded=performance.now();
     controller=null; $("#q").focus();
@@ -681,9 +810,12 @@ function handle(ctx, ev){
       // A step whose every tool call failed (dead link, PDF, consent wall) is refunded
       // server-side, so the same number comes round again — label it a retry rather
       // than showing two blocks that both claim to be "step 3".
-      const retry = ctx.lastStep!=null && ev.n<=ctx.lastStep;
-      ctx.lastStep = ev.n;
-      s.innerHTML=`<span class="steplabel">step ${ev.n}${ev.max?" of "+ev.max:""}`
+      // Planning is free, so the step after it carries the same number — not a retry.
+      const retry = ctx.lastStep!=null && ev.n<=ctx.lastStep && !ctx.afterPlan;
+      ctx.afterPlan = false;
+      ctx.lastStep = ev.n; ctx.curStep = ev.n; ctx.turns++;
+      ctx.stepCount = progressText(ctx);
+      s.innerHTML=`<span class="steplabel">step ${ev.n}${ctx.plan?" of ~"+ctx.plan.expected:""}`
                 + `${retry?' · retry (last source gave nothing)':''}</span>`;
       const th=document.createElement("div"); th.className="think"; s.appendChild(th);
       ctx.body.appendChild(s); ctx.stepEl=s; ctx.thinkEl=th; ctx.stepBuf="";
@@ -734,6 +866,16 @@ function handle(ctx, ev){
       c.textContent = (ev.ok?"✓ ":"✗ ")+ev.preview;
       (ctx.stepEl||ctx.body).appendChild(c); break;
     }
+    case "plan":{
+      // ev.final: the server settling unmarked parts as the answer lands — not a step.
+      ctx.plan = ev;
+      if(!ev.final){
+        ctx.afterPlan = true; ctx.curStep = ev.used;   // planning used no research step
+        const lbl = ctx.stepEl && ctx.stepEl.querySelector(".steplabel");
+        if(lbl) lbl.textContent = "plan · free, not a research step";
+      }
+      renderPlan(ctx); break;
+    }
     case "source":{
       if(!ctx.srcEl){ ctx.srcEl=document.createElement("div"); ctx.srcEl.className="src";
         ctx.srcEl.innerHTML='<span class="steplabel">sources read</span><br>'; ctx.body.appendChild(ctx.srcEl); }
@@ -746,6 +888,7 @@ function handle(ctx, ev){
       setStatus(ctx, "⏳ "+ev.text); break;
     }
     case "notice":{
+      if(ev.free) ctx.afterPlan = true;    // a held call: the step comes round again, uncharged
       const c=document.createElement("span"); c.className="chip warn"; c.textContent="⤴ "+ev.text;
       (ctx.stepEl||ctx.body).appendChild(c); break;
     }
@@ -910,6 +1053,11 @@ function send(){
   // Without this the question would be sent to a model that isn't loaded yet, get
   // refused as stale, and bounce back into the box looking like "send is broken".
   if(switching){ flashHint("⏳ still loading "+$("#model").value+" — your draft is kept"); return; }
+  // Send while dictating means "that's all, send it": stop the mic, and send once the
+  // transcript is in the box. One click instead of mic-then-Send.
+  if(recState==="recording" || recState==="working"){
+    sendAfterMic=true; micStop(); micHint("transcribing — sends when done…"); return;
+  }
   const q=$("#q").value.trim(); if(!q) return;
   if(history[history.length-1]!==q) history.push(q);  // no consecutive dupes
   hIdx=history.length; draft="";
@@ -1044,26 +1192,19 @@ addEventListener("pageshow", ping);
 // model that "fits" against Ollama's view can still take the desktop down. The header
 // therefore reports the machine, not one runtime — ours, anyone else's, and what's left.
 const GB = b => (b/1073741824).toFixed(1);
-// "Qwen3.8-Flash-Next-UD-Q4_K_XL" is a file name, not a model name: the quantisation
-// suffix is the longest part of the line and the least useful thing on it. The tooltip
-// still carries the full name for when it matters.
-const shortName = n => n.replace(/-(UD-)?(Q\d|IQ\d|F16|BF16)[\w.]*$/i, "");
 function renderState(s){
   const el = $("#mstate"), sel = $("#model");
   const ours = sel && sel.value;     // this tab's model, not the server's last-used one
   const mine = s.resident.find(m => m.backend === "ollama" && m.name === ours);
-  const others = s.resident.filter(m => m !== mine);
   const free = s.available, need = (s.sizes || {})[sel && sel.value] || 0;
   const short = need && free < need + s.reserve;      // the selected model wouldn't fit
-  // Order is truncation order: on a narrow header the tail is what gets clipped, so the
-  // two facts you must not lose — our model's state and the memory left — come first.
   const busy = s.busy || [];
-  const bits = [`<b>${esc(ours || "—")}</b> ${mine ? GB(mine.bytes)+" GB in RAM" : "not loaded"}`
-                + (busy.includes(ours) && !controller ? " (answering in another tab)" : "")];
-  bits.push(`<span class="free ${short ? "full" : (free < 12*1073741824 ? "tight" : "")}">`
-            + `${GB(free)} GB free</span>`);
-  for(const o of others) bits.push(`${esc(shortName(o.name))} ${GB(o.bytes)} GB`
-                                    + (busy.includes(o.name) ? " (answering)" : ""));
+  // Just the machine's two numbers: the model picker already says which model is ours,
+  // and the tooltip still lists every resident model with its size.
+  const bits = [`${GB(s.total - free)} GB RAM in use`,
+                `<span class="free ${short ? "full" : (free < 12*1073741824 ? "tight" : "")}">`
+                + `${GB(free)} GB RAM is free</span>`];
+  if(busy.includes(ours) && !controller) bits.push("model answering in another tab");
   el.querySelector(".txt").innerHTML = bits.join(" · ");
   el.classList.toggle("live", !!mine);
   el.classList.toggle("busy", typeof switching !== "undefined" && switching);
@@ -1113,12 +1254,13 @@ autosize($("#q"));   // settle the box at exactly its resting height, so the fir
 
 // ---- dictation: click to start, click to stop, then send it yourself ----
 // Two explicit triggers, no voice-activity detection, nothing that starts on its own.
-// The transcript lands in the box and is NEVER auto-sent — you read it, fix any
-// misheard word, and press Enter. That is the same contract as ✎ edit and Stop:
-// nothing puts words in front of the model without you looking at them first.
+// Stopping with the mic lands the transcript in the box to read and fix before Enter.
+// Stopping with Send (or Enter) is the shortcut: you already decided to send, so the
+// transcript goes straight out — still only ever on a click of yours.
 const mic = $("#mic");
 const MIC_MAX_MS = 90000;      // a forgotten recording stops itself, and stays under the body cap
 let recorder=null, recStream=null, recChunks=[], recTimer=null, recState="idle";
+let sendAfterMic=false;        // set when Send stopped the recording
 // The hint line is one slot and a model load may already own it, so put back what was
 // there rather than assuming the default line.
 let hintBeforeMic = null;
@@ -1175,7 +1317,7 @@ async function micStart(){
   const tick=()=>{
     const s=Math.floor((Date.now()-t0)/1000);   // a stopwatch, not a rounder: 0:01 = one second gone
     micHint("recording "+Math.floor(s/60)+":"+String(s%60).padStart(2,"0")
-            +" · click the mic to stop · Esc to discard");
+            +" · mic to stop · ⏎ to send · Esc to discard");
     if(s*1000>=MIC_MAX_MS) micStop();           // a forgotten mic transcribes what it got
   };
   tick(); recTimer=setInterval(tick,1000);
@@ -1218,8 +1360,9 @@ async function micFinished(){
     if(!text) said="didn't catch anything";
   }catch(e){ said="transcription failed: "+e.message; }
   finally{
+    const andSend=sendAfterMic; sendAfterMic=false;   // cleared on every exit, Esc included
     micIdle(); micUnhint();
-    if(text) dictate(text); else if(said) flashHint(said);
+    if(text) dictate(text, andSend); else if(said) flashHint(said);
   }
 }
 
@@ -1264,11 +1407,12 @@ function wavBase64(pcm, rate){
 
 // Append, never replace: typing half a question and dictating the rest is a real way
 // to work, and nothing else in this app clobbers what is already in the box.
-function dictate(text){
+function dictate(text, andSend){
   const el=$("#q"), cur=el.value;
   el.value = cur && !/\s$/.test(cur) ? cur+" "+text : cur+text;
   autosize(el); el.focus();
   el.setSelectionRange(el.value.length, el.value.length);
+  if(andSend){ send(); return; }
   flashHint("dictated — read it, then press Enter to send");
 }
 
@@ -1498,7 +1642,11 @@ addEventListener("pagehide", speakStop);
 // button; and SPEAKER_SVG is a const declared further up this file, so a replay during
 // top-level evaluation would sit in its temporal dead zone. loadModels() swallows its
 // own errors, so the conversation still comes back with the server down.
-loadModels().then(() => { store.turns.forEach(t => renderSaved(t.q, t.a)); stickToBottom(); });
+// The status line names THIS tab's model, read from the picker, so its first render must
+// wait for the picker to be filled — refreshState() at load runs before that and would
+// show "— not loaded" for up to one 10s refresh.
+loadModels().then(() => { store.turns.forEach(t => renderSaved(t.q, t.a)); stickToBottom();
+                          refreshState(); });
 $("#q").focus();
 </script>
 </body>

@@ -40,6 +40,7 @@ DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "muse-glimmer:30b")  # ~17 GB, 
 NUM_CTX       = int(os.environ.get("RESEARCH_NUM_CTX", "32768"))  # headroom for deep multi-fetch turns
 MAX_STEPS     = int(os.environ.get("RESEARCH_MAX_STEPS", "12"))
 FETCH_CHARS   = int(os.environ.get("RESEARCH_FETCH_CHARS", "6000"))
+FETCH_MAX_BYTES = 4 * 1024 * 1024   # a page bigger than this is read only this far
 MIN_SOURCES   = int(os.environ.get("RESEARCH_MIN_SOURCES", "0"))  # 0 = no gate, model decides; --deep/--depth to force
 MAX_NUDGES    = int(os.environ.get("RESEARCH_MAX_NUDGES", "4"))   # times we push it to go deeper
 # Default sampling temperature. 1.0 is OpenAI's recommendation for gpt-oss — see
@@ -211,12 +212,30 @@ def web_search(query, max_results=5):
         _attach_previews(out[:SEARCH_PREVIEW_N])
     return out
 
-def web_fetch(url):
-    """Download a page and return its readable text (truncated)."""
+def web_fetch(url, part=1):
+    """Download a page and return its readable text, FETCH_CHARS at a time.
+    `part` 2, 3, ... is the next stretch of the same page: the research loop asks for it
+    when the model fetches a URL it has already read, so "scroll down" is a real action
+    instead of a step that hands back the same first 6000 characters again."""
     import requests
     from bs4 import BeautifulSoup
-    resp = requests.get(url, headers={"User-Agent": UA}, timeout=25)
+    # requests' timeout bounds each socket wait, not the whole download: a server that
+    # trickles bytes kept one fetch alive for 380s (2026-10-12, SBC run). So read the body
+    # ourselves against a wall-clock deadline, and cap its size too.
+    deadline = time.time() + 25
+    resp = requests.get(url, headers={"User-Agent": UA}, timeout=(10, 10), stream=True)
     resp.raise_for_status()
+    body = bytearray()
+    for chunk in resp.iter_content(65536):
+        body += chunk
+        if time.time() > deadline:
+            resp.close()
+            if len(body) < 2000:
+                raise TimeoutError(f"{url} took longer than 25s to send its page")
+            break                      # use what arrived; the first screenful is what counts
+        if len(body) > FETCH_MAX_BYTES:
+            break
+    resp._content = bytes(body)        # so .content / .text below read what we got
     ctype = resp.headers.get("content-type", "")
     if "pdf" in ctype.lower() or resp.content[:5] == b"%PDF-":
         # Without this, a PDF arrives as compressed-binary soup: the model burns a
@@ -247,10 +266,17 @@ def web_fetch(url):
         raise UnusableSource(
             f"{url} returned almost no readable text ({len(text)} chars) — it is likely "
             "JavaScript-rendered or behind a consent wall. Try a different source.")
-    body = text[:FETCH_CHARS]
-    if len(text) > FETCH_CHARS:
-        body += "\n...[truncated]..."
-    return f"TITLE: {title}\nURL: {url}\n\n{body}"
+    total = -(-len(text) // FETCH_CHARS)            # ceil: how many parts the page has
+    if part > total:
+        raise UnusableSource(
+            f"You have already read all of {url} ({total} part(s)) — fetching it again "
+            "returns nothing new. Use what it said, or read a different page.")
+    body = text[(part - 1) * FETCH_CHARS: part * FETCH_CHARS]
+    where = f" (part {part} of {total})" if total > 1 else ""
+    if part < total:
+        body += (f"\n...[page continues — web_fetch the same URL again to read "
+                 f"part {part + 1} of {total}]")
+    return f"TITLE: {title}\nURL: {url}{where}\n\n{body}"
 
 def arxiv_search(query, max_results=5):
     """Search arXiv. Returns a list of {title, url, authors, summary}."""
@@ -295,6 +321,31 @@ TOOLS = {
 # no scraping JSON out of prose, so no escaping bugs and no "described but didn't
 # emit" stalls. Models without tool support fall back to the in-band protocol.
 TOOL_SPECS = [
+    {"type": "function", "function": {
+        "name": "plan",
+        "description": (
+            "Say how you will answer, BEFORE your first search, and update it as parts "
+            "get settled. The user sees it live as a checklist with a progress bar — it "
+            "is how they can tell you understood them and how long is left. FREE: it "
+            "does not use a research step. Skip it only for a question you answer "
+            "straight away with no tools."),
+        "parameters": {"type": "object", "properties": {
+            "reading": {"type": "string", "description": (
+                "the question in one clean line, as you understood it. Fix garbled or "
+                "misheard words here (dictation: 'view con' = 'view count').")},
+            "parts": {"type": "array", "description": "1-6 parts, split by where each answer lives",
+                      "items": {"type": "object", "properties": {
+                "part": {"type": "string", "description": "what this part answers, a few words"},
+                "how": {"type": "string", "enum": ["know", "search", "ask"], "description": (
+                    "know = you can answer it yourself (word meanings, phrasing, settled "
+                    "facts); search = needs world data AND the question says what to look "
+                    "up; ask = the question leaves its target open (which programme? which "
+                    "year?) — ask in your answer instead of searching for random examples")},
+                "steps": {"type": "integer", "description": "research steps it still needs (0 for know/ask)"},
+                "status": {"type": "string", "enum": ["todo", "done", "not_found"]},
+            }, "required": ["part", "how"]}},
+        }, "required": ["reading", "parts"]},
+    }},
     {"type": "function", "function": {
         "name": "web_search",
         "description": "Search the live web (DuckDuckGo). Returns titles, URLs and snippets.",
@@ -491,6 +542,7 @@ TOOLS (call one at a time):
 - arxiv_search  -> {"tool":"arxiv_search","args":{"query":"...","max_results":5}}
 - more_steps    -> {"tool":"more_steps","args":{"reason":"what went wrong, what you'll try next"}}
 - ask_user      -> {"tool":"ask_user","args":{"question":"Which one did you mean?","options":["...","..."]}}
+- plan          -> {"tool":"plan","args":{"reading":"the question, one clean line","parts":[{"part":"...","how":"know|search|ask","steps":1,"status":"todo|done|not_found"}]}}
 
 HOW TO ACT — first decide where the answer LIVES, then match your effort:
 1. FOLLOW-UPS — the conversation above is yours. When the question refers to
@@ -552,6 +604,25 @@ RULES:
 - Prefer primary sources (papers, official docs, repos) over blog summaries.
 - Use as many tool calls as the question deserves and no more. When you can
   answer with reasonable confidence, stop and answer.
+- PLAN FIRST: before your first research call, call plan (free — it costs no
+  step). The user watches it live: it is how they can tell you understood them
+  and how long is left. `reading` = the question in one clean line; dictated
+  questions arrive with misheard sound-alikes ("view con" = "view count",
+  "nameberg" = "number"), so fix them there. `parts` = the question split by
+  where each answer LIVES: know (what a word means, how to phrase something,
+  settled facts — answer these yourself, never search them), search (world
+  data, and only when the question says WHAT to look up — give an honest step
+  estimate), ask (it leaves its target open: which programme? which year? — do
+  not search for random examples; answer the rest and end with one short
+  question). Call plan again when a part is done or not found, or your
+  estimate changes. A question you answer straight away with no tools needs
+  no plan.
+- Your answers to the 'know' parts stand: searching adds to them, it never
+  replaces them.
+- Two searches for the same thing that both come back without it are a
+  finding, not a cue for a third rephrasing: it may not be published in that
+  form. Mark the part not_found, say so plainly in the answer, and give the
+  nearest thing that IS published — never fill the gap from memory.
 - When a question could mean more than one thing (several shows, products,
   people or versions fit the words), do not silently pick one. Find out what
   the candidates ARE: search the subject broadly (a person's whole career, a
@@ -643,6 +714,25 @@ RULES:
 - Prefer primary sources (papers, official docs, repos) over blog summaries.
 - Use as many tool calls as the question deserves and no more. When you can
   answer with reasonable confidence, stop and answer.
+- PLAN FIRST: before your first research call, call plan (free — it costs no
+  step). The user watches it live: it is how they can tell you understood them
+  and how long is left. `reading` = the question in one clean line; dictated
+  questions arrive with misheard sound-alikes ("view con" = "view count",
+  "nameberg" = "number"), so fix them there. `parts` = the question split by
+  where each answer LIVES: know (what a word means, how to phrase something,
+  settled facts — answer these yourself, never search them), search (world
+  data, and only when the question says WHAT to look up — give an honest step
+  estimate), ask (it leaves its target open: which programme? which year? — do
+  not search for random examples; answer the rest and end with one short
+  question). Call plan again when a part is done or not found, or your
+  estimate changes. A question you answer straight away with no tools needs
+  no plan.
+- Your answers to the 'know' parts stand: searching adds to them, it never
+  replaces them.
+- Two searches for the same thing that both come back without it are a
+  finding, not a cue for a third rephrasing: it may not be published in that
+  form. Mark the part not_found, say so plainly in the answer, and give the
+  nearest thing that IS published — never fill the gap from memory.
 - When a question could mean more than one thing (several shows, products,
   people or versions fit the words), do not silently pick one. Find out what
   the candidates ARE: search the subject broadly (a person's whole career, a
@@ -965,6 +1055,98 @@ def effort_for(min_sources):
     return "low" if min_sources < 3 else "high"   # Quick (1 source) / Deep (5 sources)
 
 
+# ---------- the plan, and progress measured against it ----------
+# "step 3 of 12" told the user nothing: 12 is a ceiling, not a forecast, and a run could
+# be one step from done or lost in a loop and look the same. So the model states a plan
+# (how it read the question, the parts, a step estimate for each) and the progress line,
+# the ETA and the model's own clock all count against THAT. Going past its own estimate
+# is the discourager: either a part isn't published in that form or the plan was wrong,
+# and both have an exit that isn't "search again".
+PLAN_FREE_CALLS = int(os.environ.get("RESEARCH_PLAN_FREE_CALLS", "4"))
+PLAN_HOWS = ("know", "search", "ask")
+PLAN_STATUSES = ("todo", "done", "not_found")
+
+
+def _plan_parts(raw):
+    """The model's parts list, normalised. gpt-oss sends dicts, strings or a mix (it did
+    the same with ask_user options), and an in-band call may flatten the list to text."""
+    if isinstance(raw, str):
+        try:                                  # a JSON list passed as a string
+            raw = json.loads(raw)
+        except ValueError:
+            raw = [ln.strip(" -•\t") for ln in re.split(r"[\n;]", raw)]
+    if isinstance(raw, dict):                 # {"1": {...}, "2": {...}} or one part
+        raw = list(raw.values()) if all(isinstance(v, (dict, str)) for v in raw.values()) \
+            and "part" not in raw else [raw]
+    parts = []
+    flat = []
+    for it in (raw if isinstance(raw, list) else []):
+        # gpt-oss also packs several parts into one string: "know: X; search: Y"
+        flat.extend(p.strip(" -•\t") for p in re.split(r"[\n;]", it)) \
+            if isinstance(it, str) else flat.append(it)
+    for it in [x for x in flat if x][:6]:
+        if isinstance(it, str):
+            m = re.match(r"(know|search|ask)\s*[:\-–]\s*(.+)", it, re.I)
+            it = {"part": m.group(2), "how": m.group(1)} if m else {"part": it}
+        if not isinstance(it, dict):
+            continue
+        # gpt-oss ignores the schema's field names for its own: asked for part/how/steps
+        # it sent {"description", "type", "estimated_steps"} — so read the synonyms too,
+        # and {"search": "..."} as how + part.
+        pick = lambda *keys: next((it[k] for k in keys if it.get(k) not in (None, "")), "")
+        short = [k for k in PLAN_HOWS if isinstance(it.get(k), str)]
+        name = str(pick("part", "name", "title", "task", "goal", "description", "what",
+                        "text") or (it[short[0]] if short else "")).strip()
+        name = re.split(r"(?<=[.;:])\s", name)[0].rstrip(".;:")   # one clause is enough
+        if len(name) > 110:
+            name = name[:110].rsplit(" ", 1)[0].rstrip(",") + " …"
+        if not name or name.lower() in PLAN_HOWS:
+            continue
+        how = str(pick("how", "type", "method", "kind", "approach")
+                  or (short[0] if short else "search")).strip().lower()
+        how = how if how in PLAN_HOWS else "search"
+        status = str(it.get("status", "todo")).strip().lower().replace(" ", "_")
+        status = status if status in PLAN_STATUSES else "todo"
+        try:
+            steps = int(pick("steps", "estimated_steps", "est_steps", "step_estimate")
+                        or (1 if how == "search" else 0))
+        except (TypeError, ValueError):
+            steps = 1 if how == "search" else 0
+        steps = max(0, min(steps, 8)) if how == "search" else 0
+        parts.append({"part": name, "how": how, "steps": steps, "status": status})
+    return parts
+
+
+_QUERY_STOP = {"the", "a", "an", "of", "for", "and", "in", "on", "to", "is", "what",
+               "how", "many", "much", "vs", "by", "with", "news"}
+
+
+def _query_words(q):
+    """Content words of a search query, years dropped and view/views/viewing/viewership
+    folded together — the rewording a model does when it re-asks a search that failed."""
+    out = set()
+    for w in re.findall(r"[a-z0-9]+", q.lower()):
+        if w.isdigit() or w in _QUERY_STOP:
+            continue
+        out.add(re.sub(r"(ership|ers|ing|s)$", "", w) if len(w) > 4 else w)
+    return out
+
+
+def _repeats(query, earlier):
+    """Earlier (step, query) pairs this query mostly repeats: 3 of 4 content words shared
+    (overlap coefficient >= 0.75, at least two words). Measured on two real runs it caught
+    4 of 9 searches in the BBC-ratings loop and the reshuffled 'Tornotti Nature Astronomy'
+    one, and let the genuinely new 'author list' search (0.6) through."""
+    a = _query_words(query)
+    hits = []
+    for n, q in earlier:
+        b = _query_words(q)
+        shared = len(a & b)
+        if shared >= 2 and shared / max(1, min(len(a), len(b))) >= 0.75:
+            hits.append((n, q))
+    return hits
+
+
 def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, temperature=None):
     """The research loop as a STREAM OF EVENTS — the single source of truth behind
     both the terminal renderer (run_agent) and the web UI (webapp/engine.py). It
@@ -996,6 +1178,12 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
     nudges = 0
     stalls = 0              # turns that returned only reasoning — no answer, no call
     searches_in_a_row = 0   # list-tool calls since the last web_fetch (loop detector)
+    plan = None             # the model's latest plan: {"reading", "parts", "expected"}
+    plan_calls = 0          # plan calls so far; the first PLAN_FREE_CALLS cost no step
+    plan_nagged = False     # reminded once to plan after researching without one
+    plan_demanded = False   # held the first research call once, to get the plan first
+    queries = []            # (step, query) of every search run — the repeat detector
+    fetch_parts = {}        # url -> last part read, so a re-fetch reads ON, not again
 
     max_steps = steps_for(effort)
     extensions = 0          # how many times the model has bought itself more room
@@ -1044,6 +1232,19 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                                        "Respond now with a web_fetch tool call (JSON only)."))})
                     continue
                 if content.strip():
+                    if plan:
+                        # A 'know' part is answered by writing the answer. gpt-oss almost
+                        # never ticks parts off, so an unmarked 'search' part claims only
+                        # what the loop knows: sources were read ("answered", see them) or
+                        # none were — then it came from memory, and the card says so.
+                        searched = "answered" if read_domains else "unconfirmed"
+                        settled = [dict(p, status=("done" if p["how"] == "know" else
+                                                   searched if p["how"] == "search" else
+                                                   p["status"]))
+                                   if p["status"] == "todo" else p for p in plan["parts"]]
+                        yield {"type": "plan", "reading": plan["reading"], "parts": settled,
+                               "expected": plan["expected"], "used": step - 1,
+                               "limit": max_steps, "final": True}
                     yield {"type": "final", "text": tidy_answer(content.strip())}
                     yield {"type": "done"}
                     return
@@ -1093,8 +1294,32 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                 yield {"type": "done"}
                 return
 
+            # --- plan before research ---
+            # Asked nicely (prompt, tool description, a reminder) gpt-oss planned only at
+            # step 2-6 of 4 test runs, so the plan the user is meant to see in the first
+            # seconds arrived a minute in. Hold the first research call instead: it does
+            # not run, the step is not charged, and the model is told why. Once only —
+            # a model that still won't plan gets to research without one.
+            if plan is None and not plan_demanded and any(t in TOOLS for t, _ in calls):
+                plan_demanded = True
+                step -= 1
+                yield {"type": "notice", "free": True,
+                       "text": "search held until the plan is up"}
+                held = ("NOT RUN YET: call plan first — it is free and the user is waiting "
+                        "to see how you read the question, its parts and how long it will "
+                        "take. Then make this call again.")
+                for t, _ in calls:
+                    if came_natively:
+                        messages.append({"role": "tool", "tool_name": t, "content": held})
+                    else:
+                        messages.append({"role": "user", "content":
+                                         f"OBSERVATION from {t}:\n{held}\n\nRespond now "
+                                         f"with a plan tool call (JSON only)."})
+                continue
+
             # --- tools were requested (a native model may batch several per turn) ---
             step_usable = False   # did anything in this step actually come back readable?
+            planned_only = all(t == "plan" for t, _ in calls)
             for call_idx, (tool, args) in enumerate(calls):
                 label = args.get("query") or args.get("url") or ""
                 yield {"type": "tool_call", "tool": tool, "label": label}
@@ -1136,11 +1361,93 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                                              f"Continue: call another tool (JSON only) or "
                                              f"write the FINAL ANSWER."})
                         continue
+                    if tool == "plan":
+                        # Bookkeeping, not research: it sets what progress is measured
+                        # against. `expected` counts research steps (planning excluded) —
+                        # those already used plus what the open parts still need.
+                        plan_calls += 1
+                        parts = _plan_parts(args.get("parts") or args.get("steps")
+                                            or args.get("plan") or args.get("items"))
+                        reading = str(args.get("reading") or "").strip()[:300]
+                        if not parts:
+                            raise ValueError(
+                                "plan needs `parts`: a list of {part, how, steps, status}, "
+                                "e.g. [{\"part\": \"the term\", \"how\": \"know\"}] — you "
+                                f"sent {json.dumps(args, ensure_ascii=False)[:300]}")
+                        used = step - (1 if plan_calls <= PLAN_FREE_CALLS else 0)
+                        todo = sum(p["steps"] for p in parts if p["status"] == "todo")
+                        plan = {"reading": reading or (plan or {}).get("reading", ""),
+                                "parts": parts, "expected": used + todo}
+                        yield {"type": "plan", "reading": plan["reading"], "parts": parts,
+                               "expected": plan["expected"], "used": used,
+                               "limit": max_steps}
+                        yield {"type": "observation", "tool": tool, "n": len(parts),
+                               "ok": True, "preview": f"{len(parts)} part(s) · "
+                                                      f"~{plan['expected']} research step(s)"}
+                        open_know = [p["part"] for p in parts if p["how"] == "know"]
+                        obs = (f"Plan noted (free): {len(parts)} part(s), about "
+                               f"{plan['expected']} research step(s) in all, of which "
+                               f"{used} are used. ")
+                        if not todo:
+                            obs += "Nothing left to research — write the FINAL ANSWER now. "
+                        if open_know:
+                            obs += ("Answer the 'know' parts yourself in the answer — no "
+                                    "searching for them. ")
+                        if any(p["how"] == "ask" for p in parts):
+                            obs += ("For the 'ask' parts, end the answer with one short "
+                                    "question for the missing detail. ")
+                        obs += ("Call plan again when a part is done or not found, or "
+                                "your estimate changes.")
+                        step_usable = True
+                        if came_natively:
+                            messages.append({"role": "tool", "tool_name": tool, "content": obs})
+                        else:
+                            messages.append({"role": "user", "content":
+                                             f"OBSERVATION from {tool}:\n{obs}\n\n"
+                                             f"Continue: call another tool (JSON only) or "
+                                             f"write the FINAL ANSWER."})
+                        continue
+                    if tool in ("web_search", "arxiv_search"):
+                        # Repeat-search discourager. One rewording of a search that came
+                        # up dry is fair; a third go at the same thing is the "12-step
+                        # search game" — refused, and the step is still spent, because
+                        # the reply it needs is a decision, not another query.
+                        query = str(args.get("query", ""))
+                        again = _repeats(query, queries)
+                        if len(again) >= 2:
+                            prev = ", ".join(f"step {n}" for n, _ in again[:3])
+                            obs = (f"NOT RUN: this is your third search for nearly the same "
+                                   f"thing ({prev}). It has not turned up, and rewording it "
+                                   f"again will not change that — it may simply not be "
+                                   f"published in that form. Either web_fetch a specific "
+                                   f"page you already found, or mark that part not_found "
+                                   f"with plan and write the answer: say plainly what is "
+                                   f"not published, and give the nearest thing that is.")
+                            step_usable = True
+                            yield {"type": "observation", "tool": tool, "n": 0, "ok": False,
+                                   "preview": f"not run — repeats {prev}"}
+                            yield {"type": "notice", "text": f"same search as {prev} — refused"}
+                            if came_natively:
+                                messages.append({"role": "tool", "tool_name": tool,
+                                                 "content": obs})
+                            else:
+                                messages.append({"role": "user", "content":
+                                                 f"OBSERVATION from {tool}:\n{obs}\n\n"
+                                                 f"Continue: call another tool (JSON only) "
+                                                 f"or write the FINAL ANSWER."})
+                            continue
+                        queries.append((step, query))
                     if tool not in TOOLS:
                         # a model inventing e.g. web_find gets a steer, not a bare KeyError
                         raise ValueError(f"unknown tool {tool!r} — the only tools are: "
-                                         + ", ".join(list(TOOLS) + ["more_steps", "ask_user"]))
-                    result = TOOLS[tool](args)
+                                         + ", ".join(list(TOOLS) + ["plan", "more_steps", "ask_user"]))
+                    if tool == "web_fetch":
+                        url = str(args.get("url", ""))
+                        part = fetch_parts.get(url, 0) + 1
+                        result = web_fetch(url, part)
+                        fetch_parts[url] = part
+                    else:
+                        result = TOOLS[tool](args)
                     if isinstance(result, list) and not result:
                         raise UnusableSource(
                             f"{tool} found no results for that query — it is too narrow "
@@ -1174,6 +1481,14 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                         # over (instead of reading or answering) burns minutes for nothing.
                         # After the 3rd search with no page read in between, say so to its
                         # face — right inside the observation it's about to act on.
+                        again = (_repeats(args.get("query", ""), queries[:-1])
+                                 if tool in ("web_search", "arxiv_search") else [])
+                        if again:
+                            obs += (f"\n\nNOTE: this search mostly repeats step "
+                                    f"{again[0][0]}'s ({again[0][1]!r}). If what you need "
+                                    f"is not in these results either, that is a finding — "
+                                    f"it may not be published in that form. Say so in the "
+                                    f"answer rather than searching a third way.")
                         searches_in_a_row += 1
                         if searches_in_a_row >= 3:
                             obs += (f"\n\nNOTE: that was search #{searches_in_a_row} in a row "
@@ -1210,6 +1525,8 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
             if refunded:
                 wasted += 1
                 step -= 1
+            elif calls and planned_only and plan_calls <= PLAN_FREE_CALLS:
+                step -= 1         # planning is free — it is not research
             if calls:
                 # Clock goes on the LAST message of the step, after the whole step's
                 # outcome is known. It rides inside the tool/observation content on
@@ -1219,9 +1536,34 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                     clock = (f"\n\n[that source gave nothing usable, so step {step + 1} was "
                              f"NOT charged — you still have {max_steps - step} of "
                              f"{max_steps} research steps. Try a different source.]")
+                elif plan:
+                    # Against the model's OWN plan, not the ceiling: "step 6, you planned
+                    # 4" is a question it can act on; "step 6 of 12" just says keep going.
+                    left = max_steps - step
+                    open_n = sum(p["status"] == "todo" and p["how"] == "search"
+                                 for p in plan["parts"])
+                    clock = (f"\n\n[progress: research step {step} · your plan expects "
+                             f"about {plan['expected']} · hard limit {max_steps} · "
+                             f"{open_n} search part(s) still open — mark each done or "
+                             f"not_found with plan as you settle it")
+                    if step > plan["expected"]:
+                        clock += (" — you are PAST your own estimate. If a part is not "
+                                  "turning up, it may not be published in that form: mark "
+                                  "it not_found with plan and write the answer. If the plan "
+                                  "was simply too small, call plan with a corrected estimate")
+                    elif left <= 3:
+                        clock += (f" — only {left} step(s) remain before the final answer "
+                                  "is forced")
+                    clock += "]"
                 else:
                     left = max_steps - step
                     clock = f"\n\n[progress: research step {step} of {max_steps}"
+                    if not plan_nagged and step >= 1:
+                        # One reminder only: a run that never plans still has to work.
+                        plan_nagged = True
+                        clock += (" — you have not called plan yet: call it now (free), so "
+                                  "the user can see how you read the question, its parts, "
+                                  "and how many steps are left")
                     if left <= 3:
                         # Two exits, stated together on purpose. Telling it only to
                         # converge is right when it HAS what it needs and wrong when its
@@ -1287,6 +1629,15 @@ def run_agent(model, messages, min_sources=MIN_SOURCES, temperature=None):
             at_line_start = True
         elif t == "source":
             read += 1
+        elif t == "plan":
+            newline()
+            marks = {"done": "✓", "not_found": "✗"}
+            lines = [f"  ▤ plan · ~{ev.get('expected')} research step(s) · {ev.get('reading', '')}"]
+            lines += [f"     {marks.get(p['status'], '·')} {p['part']} ({p['how']}"
+                      f"{', ~' + str(p['steps']) if p['how'] == 'search' else ''})"
+                      for p in ev.get("parts", [])]
+            sys.stdout.write(c("\n".join(lines) + "\n", C.cyan))
+            at_line_start = True
         elif t == "notice":
             newline()
             sys.stdout.write(c(f"  ⤴ {ev['text']}\n", C.yellow))

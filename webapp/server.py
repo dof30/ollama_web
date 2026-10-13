@@ -163,6 +163,15 @@ EMBEDDING_NAME = re.compile(r"embed", re.I)
 HIDDEN_MODELS = tuple(filter(None, (s.strip() for s in os.environ.get(
     "RESEARCH_HIDE_MODELS", "qwen3.5,qwen3.8,qwen3.6").split(","))))
 
+# Exact tags that survive HIDDEN_MODELS. Hiding by prefix is what lets one word retire a
+# whole family, but it cannot say "this family except this one build" — and that is the
+# shape of the Qwen decision: qwen3.8:27b joined the picker on 2026-10-10 as the only Qwen
+# anyone here chooses, while qwen3.5, qwen3.6 and every other qwen3.8 tag stay out. Exact
+# tags only, never prefixes: a prefix here would silently re-open the family the hide list
+# just closed, which is the one mistake this pair of lists exists to prevent.
+SHOWN_MODELS = frozenset(filter(None, (s.strip() for s in os.environ.get(
+    "RESEARCH_SHOW_MODELS", "qwen3.8:27b").split(","))))
+
 # Ollama 0.40 lists a GGUF adopted from a llama.cpp install under its digest
 # ("llamacpp:6e67eb…") and can list the same tag twice, once per digest. Neither is a
 # model anyone picks by that name, and a picker with two identical "GPT-OSS" rows is
@@ -177,7 +186,8 @@ def list_models():
         names = [m["name"] for m in tags.get("models", [])
                  if not EMBEDDING_NAME.search(m["name"])
                  and not DIGEST_NAME.search(m["name"])
-                 and not m["name"].startswith(HIDDEN_MODELS)]
+                 and (m["name"] in SHOWN_MODELS
+                      or not m["name"].startswith(HIDDEN_MODELS))]
         return list(dict.fromkeys(names))   # de-duplicate, keeping Ollama's order
     except Exception:
         return []
@@ -326,7 +336,7 @@ def admit(target):
     if target in loaded_models():
         return True, {"need": 0, "free": available, "frees": [], "blockers": []}
     sizes = model_sizes()
-    plan, room, busy = eviction_plan(target, sizes, available)
+    plan, room, busy, foreign = eviction_plan(target, sizes, available)
     blockers = [s for s in llama_servers() if s["bytes"] > 0]
     detail = {"need": sizes.get(target, 0), "free": room, "reserve": RAM_RESERVE,
               "frees": plan, "blockers": blockers}
@@ -337,6 +347,10 @@ def admit(target):
         detail["why"] = (f"{target} would have to unload {', '.join(busy)}, which is "
                          f"answering in another tab right now — try again when it finishes")
         return False, detail
+    if foreign:
+        detail["why"] = (f"{target} needs the room {', '.join(foreign)} holds, and that model "
+                         f"was loaded by another app — deactivate it there or in the AI Hub first")
+        return False, detail
     return sizes[target] + RAM_RESERVE <= room, detail
 
 
@@ -344,44 +358,69 @@ def admit(target):
 LAST_USED = {}
 
 
+# Which models may be resident together is arithmetic, not a rule: the AI Hub keeps a
+# table of every combination of models and whether their measured sizes fit (hubplan.py,
+# plan.json), and this app, the other web app and the hub all ask the same table — kong
+# (2026-10-11): "I trust math, not guess". Before that it was a fixed rule: only gpt-oss
+# and qwen3.6 side by side, everything else one at a time. Without the hub, free memory
+# alone decides.
+AIHUB_DIR = os.environ.get("AIHUB_DIR", "/home/kong/aihub")
+
+
+def _plan_table():
+    """The hub's plan table, or None if the hub is not there."""
+    try:
+        if AIHUB_DIR not in sys.path:
+            sys.path.append(AIHUB_DIR)        # appended: never shadows this app's modules
+        import hubplan
+        return hubplan.load()
+    except Exception:
+        return None
+
+
 def eviction_plan(target, sizes=None, available=None):
-    """Which resident Ollama models must go for `target` to load. -> (plan, room, busy)
+    """Which resident Ollama models must go for `target` to load.
+    -> (plan, room, busy, foreign)
 
     `room` is the memory there will be once the plan has run; `busy` is the part of the
-    plan that is answering in some tab and so cannot go (admit() refuses on it).
+    plan that is answering in some tab and so cannot go; `foreign` are models that may
+    not stay beside `target` but that this app did not load (admit() refuses on both).
 
-    Models share the machine whenever they fit. Loading a second model used to evict the
-    first unconditionally — one model per app — which on 119 GB meant a 17 GB
-    muse-glimmer was thrown out to make room for a 61 GB gpt-oss that fitted beside it
-    with 40 GB to spare. Now the rules are:
-      * a model at BIG_MODEL_BYTES or above never shares, in either direction: loading
-        one clears the box, and loading anything else evicts it. qwen3.5:122b (~81 GB,
-        no longer offered in the picker but still on disk) is the case this guards:
-        next to anything it is one long answer away from swapping.
-      * otherwise nothing goes unless the RAM math says it must, and then only models
-        THIS app loaded, least recently used first, just until the target fits.
+    Models share whenever they fit, by the hub's plan table: the fewest models are
+    unloaded to make room — this app's own idle ones first, least recently used first.
+    A model answering right now is never chosen if any plan spares it; if none does it
+    is named, and admit() refuses with the reason. A model another app or program loaded
+    is never pulled out from under it: this app cannot see that app's running answers,
+    so the load is refused with the reason instead.
+    Embedding models (Local_embedder keeps one resident) are never unloaded: they are
+    small, never chat, and unloading them would break their own app.
     Split out from the eviction itself so admission control can ask what a load would
     cost without performing it."""
     sizes = model_sizes() if sizes is None else sizes
     if available is None:
         _, available = mem_info()
-    others = [m for m in loaded_models() if m != target]
-    if sizes.get(target, 0) >= BIG_MODEL_BYTES:
-        plan = others
-    else:
-        plan = [m for m in others if sizes.get(m, 0) >= BIG_MODEL_BYTES]
-    room = available + sum(sizes.get(m, 0) for m in plan)
-    need = sizes.get(target, 0) + RAM_RESERVE
+    others = [m for m in loaded_models() if m != target and not EMBEDDING_NAME.search(m)]
     busy_now = busy_models()
-    spare = sorted((m for m in others
-                    if m not in plan and m in APP_MODELS and m not in busy_now),
-                   key=lambda m: LAST_USED.get(m, 0))
-    for m in spare:
-        if room >= need:
-            break
-        plan.append(m)
-        room += sizes.get(m, 0)
-    return plan, room, [m for m in plan if m in busy_now]
+    theirs = [m for m in others if m not in APP_MODELS]
+    table = _plan_table()
+    if table is not None and table.knows(target):
+        outside = sum(sizes.get(m, 0) for m in others if not table.knows(m)) / 2**30
+        must = table.evict(others, target, keep=busy_now, avoid=theirs,
+                           last_used=LAST_USED, extra_gib=outside)
+        if must is None:      # only by unloading something mid-answer: name it, admit() refuses
+            must = table.evict(others, target, avoid=theirs, last_used=LAST_USED,
+                               extra_gib=outside) or [m for m in others if table.knows(m)]
+    else:
+        need, room, must = sizes.get(target, 0) + RAM_RESERVE, available, []
+        for m in sorted(others, key=lambda m: (m in busy_now, m in theirs, LAST_USED.get(m, 0))):
+            if room >= need:
+                break
+            must.append(m)
+            room += sizes.get(m, 0)
+    foreign = [m for m in must if m not in APP_MODELS]
+    plan = [m for m in must if m in APP_MODELS]
+    room = available + sum(sizes.get(m, 0) for m in plan)
+    return plan, room, [m for m in plan if m in busy_now], foreign
 
 
 def free_ram_for(target):
@@ -648,7 +687,12 @@ class Handler(BaseHTTPRequestHandler):
                                         "default": DEFAULT_MODEL,
                                         "active": ACTIVE_MODEL,
                                         "voice": voice.available(),
-                                        "speech": speech.available()}))
+                                        "speech": speech.available(),
+                                        # per-capacity step limits, for the cups' hover text
+                                        "steps": {e: agent.steps_for(e)
+                                                  for e in ("low", "medium", "high")},
+                                        "extension": [agent.STEP_EXTENSION,
+                                                      agent.MAX_EXTENSIONS]}))
         elif path == "/api/state":
             # What is holding RAM right now, across BOTH runtimes, for the header.
             self._send(200, json.dumps(machine_state()), extra={"Cache-Control": "no-store"})
