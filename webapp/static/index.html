@@ -98,26 +98,24 @@
   .src a{color:var(--link);text-decoration:none;word-break:break-all}
   .src a:hover{text-decoration:underline}
   .answer{margin-top:12px;display:flow-root}
-  /* The pocket: an encyclopedia card and the figures from pages the model read, floated
-     beside the answer like a Wikipedia infobox, so the text wraps around it. */
-  .pocket{float:right;width:232px;margin:2px 0 10px 18px;display:flex;flex-direction:column;gap:10px}
-  .kcard,.fig{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
-  .kcard img{display:block;width:100%;max-height:260px;object-fit:cover;background:var(--chip)}
-  .kcard .kb{padding:9px 11px 10px}
-  .kcard .kt{font-weight:600;margin-bottom:3px}
-  .kcard .kx{font-size:.88em;line-height:1.45;color:var(--ink);display:-webkit-box;
-             -webkit-line-clamp:9;-webkit-box-orient:vertical;overflow:hidden}
-  .kcard a,.fig a{color:var(--link);font-size:.85em}
-  .gallery{display:flex;flex-direction:column;gap:8px}
-  .gallery .gh{font-size:.78em;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
-  .fig img{display:block;width:100%;max-height:200px;object-fit:contain;background:#fff;cursor:zoom-in}
-  .fig .fc{padding:5px 9px 7px;font-size:.8em;color:var(--dim);line-height:1.35}
-  .fig .seen{color:var(--accent);font-weight:600}
+  /* One compact card per answer — a picture and a few lines — floated in the text like a
+     Wikipedia print layout. It was a column of every image from every page (2026-10-13:
+     longer than the answer, with a network switch and a stranger in it). */
+  .pocket{float:right;width:210px;margin:3px 0 8px 16px}
+  .kcard{background:var(--panel);border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .kcard img{display:block;width:100%;height:128px;object-fit:cover;background:var(--chip);cursor:zoom-in}
+  .kcard .kb{padding:7px 9px 8px}
+  .kcard .kt{font-weight:600;font-size:.92em;line-height:1.3;margin-bottom:2px;display:-webkit-box;
+             -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .kcard .kx{font-size:.82em;line-height:1.4;color:var(--dim);display:-webkit-box;
+             -webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+  .kcard a{color:var(--link);font-size:.8em}
+  .kcard .kwait{color:var(--dim);font-size:.85em}
   #lightbox{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.82);display:flex;
             align-items:center;justify-content:center;padding:16px;cursor:zoom-out}
   #lightbox img{max-width:96vw;max-height:88vh;background:#fff;border-radius:6px}
   #lightbox .lc{position:absolute;bottom:14px;left:16px;right:16px;text-align:center;color:#eee;font-size:.9em}
-  @media (max-width:640px){ .pocket{float:none;width:auto;margin:0 0 12px} .kcard img{max-height:200px} }
+  @media (max-width:640px){ .pocket{width:150px;margin:3px 0 6px 12px} .kcard img{height:96px} }
   .answer h1,.answer h2,.answer h3{font-size:1.05em;margin:1em 0 .3em}
   .answer p{margin:.5em 0}
   .answer ul,.answer ol{margin:.4em 0 .4em 1.3em;padding:0}
@@ -519,12 +517,9 @@ let currentModel = null;   // what is actually loaded/selected, so a cancelled s
 // and the parameter count is noise at the moment of choosing. So the label is the name
 // alone, capitalised the way it is actually spoken, which gives the eye a shape to catch.
 // The option's VALUE keeps the exact tag the server expects.
-// Two tags whose size is part of the name you'd say out loud. Stripping ":27b" leaves
-// "Qwen3.8", which names the FAMILY — and the family is precisely what this picker does
-// not offer (server.py keeps one build of it and hides the rest), so the short label would
-// promise a choice that isn't there. Keyed by exact tag: another build has to earn its own
-// entry rather than inherit this one.
-const MODEL_LABELS = {"qwen3.8:27b": "Qwen3.8 27b"};
+// Exact-tag labels for names whose size is part of what you'd say out loud ("Qwen3.8 27b"
+// was the one entry until the Qwens left the picker on 2026-10-13).
+const MODEL_LABELS = {};
 const UPPERCASE_WORDS = /^(gpt|oss)$/i;
 function prettyModel(name){
   if(MODEL_LABELS[name]) return MODEL_LABELS[name];
@@ -613,50 +608,36 @@ function addAskButtons(ansEl, opts){
   ansEl.appendChild(box);
 }
 
-// ---- the pocket: encyclopedia card + figures, floated beside the answer ----
-// holder: {card, figs}. Rebuilt whole on every change — it is a handful of nodes — and
-// always put back first in the answer, since the final answer replaces its contents.
+// ---- the card: one picture and a few lines, floated in the answer ----
+// holder: {card}. Put back first in the answer on every paint, since the final answer
+// replaces the answer's contents. A picture that fails or never arrives is dropped
+// (a host that never answers raises no error, so it gets 20 s) and the text stays.
 function paintPocket(ansEl, holder){
   let pk = ansEl.querySelector(":scope > .pocket");
-  if(!holder.card && !(holder.figs||[]).some(f => !f.dead)){ if(pk) pk.remove(); return; }
+  const c = holder && holder.card;
+  if(!c){ if(pk) pk.remove(); return; }
   if(!pk){ pk = document.createElement("aside"); pk.className = "pocket"; }
   ansEl.insertBefore(pk, ansEl.firstChild);
   pk.innerHTML = "";
-  const c = holder.card;
-  if(c){
-    const k = document.createElement("div"); k.className = "kcard";
-    if(c.image){ const im = document.createElement("img"); im.src = c.image; im.alt = c.title;
-                 im.loading = "lazy"; im.onerror = () => im.remove(); k.appendChild(im); }
-    const b = document.createElement("div"); b.className = "kb";
-    b.innerHTML = '<div class="kt">'+esc(c.title)+'</div><div class="kx">'+esc(c.extract)+'</div>'
-      + (c.url ? '<a href="'+esc(c.url)+'" target="_blank" rel="noopener">Continued in '+esc(c.source||"Wikipedia")+' ›</a>' : "");
-    k.appendChild(b); pk.appendChild(k);
+  const k = document.createElement("div"); k.className = "kcard";
+  if(c.wait){
+    k.innerHTML = '<div class="kb kwait"><span class="spin">◐</span> finding a picture…</div>';
+    pk.appendChild(k); return;
   }
-  const figs = holder.figs || [];
-  if(figs.some(f => !f.dead)){
-    const g = document.createElement("div"); g.className = "gallery";
-    g.innerHTML = '<div class="gh">Figures from the pages read</div>';
-    figs.filter(f => !f.dead).forEach(f => {
-      const d = document.createElement("div"); d.className = "fig";
-      // Not lazy: the 20 s deadline below would otherwise fire on a chart that simply
-      // hadn't been scrolled to yet. There are at most 8.
-      const im = document.createElement("img"); im.alt = f.caption;
-      im.referrerPolicy = "no-referrer";    // hotlink-guarded hosts serve when no referrer is sent
-      // Blocked or gone: drop it rather than show a hole. A host that never answers (Aliyun
-      // OSS from here) raises no error at all — the image just stays "loading" — so it
-      // gets 20 s. `dead` keeps a repaint from bringing it back.
-      const drop = () => { f.dead = true; d.remove(); };
-      im.onerror = drop; im.src = f.url;     // referrerPolicy must be set before src
-      setTimeout(() => { if(!im.naturalWidth) drop(); }, 20000);
-      im.onclick = () => openLightbox(f.url, f.caption);
-      const cap = document.createElement("div"); cap.className = "fc";
-      cap.innerHTML = esc(f.caption || "figure")
-        + (f.viewed ? ' · <span class="seen" title="the model looked at this one">read by '+esc((f.by||"model").split(":")[0])+'</span>' : "")
-        + ' · <a href="'+esc(f.url)+'" target="_blank" rel="noopener">open</a>';
-      d.appendChild(im); d.appendChild(cap); g.appendChild(d);
-    });
-    pk.appendChild(g);
+  if(c.image && !c.dead){
+    const im = document.createElement("img"); im.alt = c.title; im.referrerPolicy = "no-referrer";
+    const drop = () => { c.dead = true; im.remove(); };
+    im.onerror = drop; im.src = c.image;
+    setTimeout(() => { if(!im.naturalWidth) drop(); }, 20000);
+    im.onclick = () => openLightbox(c.image, c.extract || c.title);
+    k.appendChild(im);
   }
+  const b = document.createElement("div"); b.className = "kb";
+  b.innerHTML = '<div class="kt">'+esc(c.title)+'</div>'
+    + (c.extract ? '<div class="kx">'+esc(c.extract)+'</div>' : "")
+    + (c.url ? '<a href="'+esc(c.url)+'" target="_blank" rel="noopener">'
+             + (c.photo ? esc(c.source)+' ›' : 'Continued in '+esc(c.source||"Wikipedia")+' ›') + '</a>' : "");
+  k.appendChild(b); pk.appendChild(k);
 }
 function openLightbox(url, caption){
   const lb = document.createElement("div"); lb.id = "lightbox";
@@ -713,7 +694,7 @@ function newTurn(question){
   return {t, trace, sum, body, ans, stream,
           stepEl:null, thinkEl:null, srcEl:null, stepBuf:"", loadTimer:null,
           answering:false, ansLive:null, lastStep:null, stepCount:"", label:"thinking…",
-          plan:null, planEl:null, afterPlan:false, curStep:0, turns:0, card:null, figs:[],
+          plan:null, planEl:null, afterPlan:false, curStep:0, turns:0, card:null,
           t0:performance.now(), tick:null};
 }
 
@@ -843,7 +824,7 @@ async function ask(question, retried=false, warmup=false){
   }finally{
     clearLoad(ctx); stopClock(ctx);
     if(finalText) rememberTurn(question, finalText,   // survive reload / other tabs
-                               (ctx.card || ctx.figs.length) ? {card: ctx.card, figs: ctx.figs} : null);
+                               ctx.card && !ctx.card.wait ? {card: ctx.card} : null);
     sendMode("send"); runEnded=performance.now();
     controller=null; $("#q").focus();
     refreshState();    // answering may have pulled the model in — say so straight away
@@ -952,15 +933,19 @@ function handle(ctx, ev){
       // them as buttons rather than as the bullet list its text carries.
       ctx.askQ = ev.question; ctx.askOpts = ev.options || []; break;
     }
-    case "card":{
-      ctx.card = {title:ev.title, extract:ev.extract, image:ev.image, url:ev.url, source:ev.source};
-      paintPocket(ctx.ans, ctx); break;
+    case "card_wait":
+      // The answer is already readable; a vision model is now picking the picture.
+      ctx.card = {wait:true}; paintPocket(ctx.ans, ctx); break;
+    case "card_none":{
+      ctx.card = null; paintPocket(ctx.ans, ctx);
+      if(ev.why){ const c=document.createElement("span"); c.className="chip warn";
+                  c.textContent="no picture — "+ev.why; ctx.body.appendChild(c); }
+      break;
     }
-    case "figure":{
-      // One entry per image: a later view of the same chart only marks it as read.
-      const f = ctx.figs.find(x => x.url === ev.url);
-      if(f){ if(ev.viewed){ f.viewed = true; f.by = ev.by; } }
-      else if(ctx.figs.length < 8) ctx.figs.push({url:ev.url, caption:ev.caption||"", viewed:!!ev.viewed, by:ev.by||""});
+    case "card":{
+      // Arrives after the text: copied from Wikipedia, or the photo a vision model picked.
+      ctx.card = {title:ev.title, extract:ev.extract, image:ev.image, url:ev.url,
+                  source:ev.source, photo:!!ev.photo};
       paintPocket(ctx.ans, ctx); break;
     }
     case "final":{

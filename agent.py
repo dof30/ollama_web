@@ -335,7 +335,7 @@ Answer from the picture, briefly (under 200 words):
 Report only what is in the image. If something is too small to read, say so."""
 
 
-def _image_png_b64(url):
+def _image_png_b64(url, max_side=None):
     """Download an image and return (base64 PNG, (w, h)), ready for Ollama's `images`.
     Re-encoded as PNG because Ollama decodes only a few formats (no WebP/AVIF/GIF on
     every build), flattened onto white because a transparent chart becomes black-on-
@@ -374,7 +374,8 @@ def _image_png_b64(url):
         im = bg
     else:
         im = im.convert("RGB")
-    im.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE))
+    side = max_side or IMAGE_MAX_SIDE
+    im.thumbnail((side, side))
     buf = io.BytesIO()
     im.save(buf, "PNG")
     return base64.b64encode(buf.getvalue()).decode(), im.size
@@ -447,13 +448,27 @@ def _subject(q):
     core = [w for w in ws if w.lower().strip("'") not in _ASK_WORDS]
     return " ".join(core).rstrip(".")
 
-def _wiki_summary(api, title):
+def _wiki_get(url, params=None):
+    """GET from Wikipedia, retrying once on 429: Wikimedia throttles bursts of anonymous
+    calls, and a refused lookup silently cost a card (and sent gpt-oss searching for
+    "quill multiple meanings", 2026-10-13)."""
     import requests
-    r = requests.get(api + "/api/rest_v1/page/summary/" + urllib.parse.quote(title.replace(" ", "_")),
-                     headers={"User-Agent": WIKI_UA}, timeout=4)
+    for attempt in (0, 1):
+        try:
+            r = requests.get(url, params=params, headers={"User-Agent": WIKI_UA}, timeout=5)
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt:
+                raise
+            continue                      # this link drops requests; one retry is cheap
+        if r.status_code != 429 or attempt:
+            return r
+        time.sleep(1.5)
+
+def _wiki_summary(api, title):
+    r = _wiki_get(api + "/api/rest_v1/page/summary/" + urllib.parse.quote(title.replace(" ", "_")))
     return r.json() if r.status_code == 200 else None
 
-def encyclopedia_card(question):
+def encyclopedia_card(question, report=None):
     """{title, extract, image, url, source, lang} for the article the question names, or None.
     Silent on every failure: a missing card costs nothing, a slow one would cost the
     user's first second, so each request is held to a few seconds. Frugal on purpose:
@@ -479,13 +494,15 @@ def encyclopedia_card(question):
                 _CARD_CACHE[key] = None   # "mercury": several articles — don't guess one
                 return None
         if not d or d.get("type") != "standard":
-            hits = requests.get(api + "/w/api.php", headers={"User-Agent": WIKI_UA}, timeout=4,
-                                params={"action": "query", "list": "search", "srsearch": subj[:250],
-                                        "srlimit": 6, "format": "json"}).json()["query"]["search"]
+            hits = _wiki_get(api + "/w/api.php", {"action": "query", "list": "search",
+                                                  "srsearch": subj[:250], "srlimit": 6,
+                                                  "format": "json"}).json()["query"]["search"]
             qwords = _words(q)
             title = next((h["title"] for h in hits if _names_title(h["title"], q, qwords)), None)
             d = _wiki_summary(api, title) if title else None
-    except Exception:
+    except Exception as e:
+        if report is not None:            # said in the trace, not swallowed (Ada, 2026-10-13)
+            report["why"] = f"Wikipedia lookup failed: {type(e).__name__}"
         return None                       # not cached: a 429 or timeout may pass
     card = None
     if d and d.get("type") == "standard" and d.get("extract"):
@@ -495,6 +512,42 @@ def encyclopedia_card(question):
                 "source": "Wikipedia", "lang": lang}
     _CARD_CACHE[key] = card
     return card
+
+
+# ---------- one photo for the card, when there is no encyclopedia card ----------
+# The first version showed every image from every page read, and kong's Orange Pi answer
+# came back with a column of pictures longer than the answer — a UniFi switch, a person —
+# (2026-10-13: "compare which image is the most helpful ... I just only need one brief
+# card"). So: at most ONE picture, and only a photo that plainly shows what the question
+# is about. Charts, screenshots and logos never qualify (kong elsewhere: a report picture
+# is a photo of a real thing; someone else's chart is not one).
+_NOT_A_PHOTO = re.compile(r"chart|graph|plot|diagram|table|screenshot|screen ?shot|"
+                          r"benchmark|score|result|fastfetch|neofetch|terminal|console|"
+                          r"output|logo|icon|banner|badge|avatar|author|profile|headshot|"
+                          r"sponsor|advert|\bad\b|thumbnail|placeholder|newsletter", re.I)
+_CARD_STOP = _ASK_WORDS | set("""why how when where not very much more most than other others
+existing considering compared compare versus vs between best better worse good bad really
+still also just only even does doesn't isn't aren't new latest current popular""".split())
+
+def photo_score(alt, src, qwords):
+    """Key words an image's caption/file name shares with the question; 0 for non-photos.
+    Only a pre-filter: the vision model looks at the survivors and picks (card_stage)."""
+    name = urllib.parse.unquote(urllib.parse.urlparse(src).path.rsplit("/", 1)[-1])
+    text = f"{alt} {re.sub(r'[_-]+', ' ', name)}"
+    if _NOT_A_PHOTO.search(text):
+        return 0
+    text = re.sub(r"([a-z])([A-Z0-9])", r"\1 \2", text)      # "OrangePi6" -> "Orange Pi 6"
+    tw = set(re.findall(r"[a-z0-9]+", text.lower()))
+    tw |= {w[:-1] for w in tw if len(w) > 3 and w.endswith("s")}
+    # Each question word counts once, matched as written or as its singular.
+    shared = sum(1 for w in qwords if w in tw or (w.endswith("s") and w[:-1] in tw))
+    return shared
+
+def card_words(question):
+    """The question's key words, as written (no singular copies)."""
+    return {w for w in re.findall(r"[a-z0-9]+", question.lower())
+            if w not in _CARD_STOP and w not in ("its", "it", "this", "that", "they")
+            and len(w) > 1}
 
 
 def arxiv_search(query, max_results=5):
@@ -692,9 +745,27 @@ def date_context():
     ).format(today.strftime("%A, %B %d, %Y").replace(" 0", " "))
 
 
-def system_prompt(native):
-    """Final system prompt: fresh date block + the protocol-appropriate prompt."""
-    return date_context() + "\n\n" + (SYSTEM_NATIVE if native else SYSTEM)
+_FIGURE_RULE = """   Fetched text marks pictures as [image: alt — url]. Text alone misses what a
+   figure shows: when the question's answer, or a page summary's key result,
+   sits in a chart, plot, benchmark figure or diagram, call view_image on it
+   rather than guessing from the caption — and say in the answer what the
+   figure shows. Skip logos, photos and decoration.
+"""
+_FIGURE_RULE_BLIND = """   Fetched text marks pictures as [image: alt — url]. You cannot see them: when
+   a chart or figure holds a result the question needs, say so in the answer
+   and link it, rather than guessing what it shows from the caption.
+"""
+
+def system_prompt(native, vision=True):
+    """Final system prompt: fresh date block + the protocol-appropriate prompt. A model
+    without vision is not offered view_image (it would load a second model mid-turn —
+    kong, 2026-10-13: don't load the helper until the main model has finished)."""
+    text = SYSTEM_NATIVE if native else SYSTEM
+    if not vision:
+        text = (text.replace(_FIGURE_RULE, _FIGURE_RULE_BLIND)
+                    .replace("arxiv_search, view_image)", "arxiv_search)")
+                    .replace('- view_image    -> {"tool":"view_image","args":{"url":"https://...png","question":"what you need from it"}}\n', ""))
+    return date_context() + "\n\n" + text
 
 
 # The system-prompt date block alone loses to habit under a real task: the model
@@ -1395,8 +1466,7 @@ def _borrow_freely(model):
     yield True, ""
 
 
-def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, temperature=None,
-                    borrow=None):
+def _research_core(model, messages, min_sources, effort, temperature, borrow, state):
     """The research loop as a STREAM OF EVENTS — the single source of truth behind
     both the terminal renderer (run_agent) and the web UI (webapp/engine.py). It
     drives the ReAct tool loop, mutating `messages` in place so follow-ups keep
@@ -1417,21 +1487,33 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
     # The web UI names the level outright; the CLI only says how many sources it
     # wants, so infer one from that.
     effort = effort or effort_for(min_sources)
-    tools = TOOL_SPECS if native else None
+    vision = model_has_vision(model)
+    tools = (TOOL_SPECS if vision else
+             [t for t in TOOL_SPECS if t["function"]["name"] != "view_image"]) if native else None
     # The two protocols need different instructions, the user can switch models
     # mid-session, and the date block must stay current in long-lived sessions —
     # so refresh the system prompt on every call. messages[0] is always the
     # system message (every working copy starts from it).
     if messages and messages[0].get("role") == "system":
-        messages[0]["content"] = system_prompt(native)
+        messages[0]["content"] = system_prompt(native, vision)
     question = messages[-1]["content"] if messages and messages[-1].get("role") == "user" else ""
     stamp_current_question(messages)  # date lands next to the question, where attention is
-    card = encyclopedia_card(question) if question else None
+    # The lookup runs beside the turn. The model waits up to 4 s for it (its text is a free
+    # source); a slower lookup still lands as the card, which is shown after the answer.
+    import threading
+    box = {}
+    looker = threading.Thread(target=lambda: box.update(card=encyclopedia_card(question, box)),
+                              daemon=True)
+    if question:
+        looker.start()
+        looker.join(4)
+    card = box.get("card")
+    state.update(question=question, card=card, card_box=box,
+                 card_thread=looker if question else None)
     if card:
-        yield {"type": "card", **card}
-        # The model gets the same text the user sees, as a free source it may lean on:
+        # The model gets the text the card will show, as a free source it may lean on:
         # a "What" question can then be answered without spending a research step.
-        messages[-1]["content"] += (f"\n[encyclopedia, shown to the user above your answer — "
+        messages[-1]["content"] += (f"\n[encyclopedia, shown to the user beside your answer — "
                                     f"Wikipedia, \"{card['title']}\" ({card['url']}): "
                                     f"{card['extract']}]")
     if min_sources > 0:
@@ -1446,6 +1528,8 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
     queries = []            # (step, query) of every search run — the repeat detector
     fetch_parts = {}        # url -> last part read, so a re-fetch reads ON, not again
     page_figs = {}          # url -> [(alt, image url)] seen in its fetched parts
+    page_titles = {}        # url -> its <title>, for the photo card
+    state.update(page_figs=page_figs, page_titles=page_titles)
     viewed = set()          # image urls already looked at with view_image
 
     max_steps = steps_for(effort)
@@ -1544,6 +1628,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
             # user before going any further.
             ask = next((a for t, a in calls if t == "ask_user"), None)
             if ask is not None:
+                state["asked"] = True
                 question = str(ask.get("question") or "").strip() or "Which one did you mean?"
                 options = ask.get("options") or []
                 if isinstance(options, str):          # a lenient in-band call may flatten it
@@ -1629,7 +1714,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                         # model decides it is done (both muse runs: plan, then the answer).
                         unseen = [f for figs_ in page_figs.values() for f in figs_
                                   if f[1] not in viewed]
-                        if unseen:
+                        if unseen and vision:
                             obs += ("Pages you read have figures you have not looked at: " +
                                     "; ".join(f"'{a}' ({u})" for a, u in unseen[:4]) +
                                     ". If one carries a result your answer needs — for a "
@@ -1696,25 +1781,17 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                     elif tool == "view_image":
                         url = str(args.get("url", "")).strip()
                         question = str(args.get("question") or "")
-                        if model_has_vision(model):
-                            viewer = model        # it holds this turn already: no load
-                            result = view_image(url, question, viewer)
-                        else:
-                            viewer = VISION_MODEL
-                            yield {"type": "notice", "text": f"{model} can't see images — "
-                                                             f"{viewer} is reading this one"}
-                            with borrow(viewer) as (ok, why):
-                                if not ok:
-                                    raise UnusableSource(
-                                        f"Could not view the image: {why}. Work from the "
-                                        f"page text, and tell the user the figure at {url} "
-                                        f"was not read.")
-                                result = view_image(url, question, viewer)
+                        if not vision:
+                            # No helper mid-turn: a second model loading while this one
+                            # works costs GPU for both (kong, 2026-10-13). Text-only models
+                            # aren't offered the tool; this catches one that calls it anyway.
+                            raise UnusableSource(
+                                "view_image is not available to you. Work from the page "
+                                f"text, and if the figure matters, link it ({url}) in the "
+                                "answer and say it was not read.")
+                        viewer = model            # it holds this turn already: no load
+                        result = view_image(url, question, viewer)
                         viewed.add(url)
-                        alt = next((f[0] for fs in page_figs.values() for f in fs
-                                    if f[1] == url), "")
-                        yield {"type": "figure", "url": url, "caption": alt or question[:120],
-                               "viewed": True, "by": viewer}
                     else:
                         result = TOOLS[tool](args)
                     if isinstance(result, list) and not result:
@@ -1741,18 +1818,15 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                         # forgotten it by part 5 — so the last part repeats the page's
                         # figures not yet viewed.
                         figs = re.findall(r"\[image: (.+?) — (\S+?)(?:, \d+x\d+)?\]", result)
-                        # Every figure passed goes to the page's gallery too: when the model
-                        # doesn't look (it usually doesn't, on a summary), the user still can.
-                        for alt, src in figs:
-                            if all(src != f[1] for fs in page_figs.values() for f in fs):
-                                yield {"type": "figure", "url": src, "caption": alt,
-                                       "page": url, "viewed": False}
+                        page_titles.setdefault(url, re.sub(
+                            r"\s+[|\-–—:]\s+[^|\-–—:]*$", "",
+                            result.split("\n", 1)[0].removeprefix("TITLE: "))[:90])
                         page_figs.setdefault(url, []).extend(f for f in figs
                                                              if f not in page_figs[url])
                         last = not pm or pm[1] == pm[2]     # single-part page, or its end
                         not_seen = [f for f in (page_figs[url] if last else figs)
                                 if f[1] not in viewed]
-                        if not_seen:
+                        if not_seen and vision:
                             obs += ("\n\nNOTE: " + ("this page has" if last else "this part has") +
                                     (f" {len(not_seen)} images" if len(not_seen) > 1 else " an image") +
                                     " the text cannot show, not viewed yet: " +
@@ -1873,6 +1947,101 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
     except Exception as e:
         yield {"type": "error", "text": f"{type(e).__name__}: {e}"}
         yield {"type": "done"}
+
+
+def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, temperature=None,
+                    borrow=None):
+    """The research loop (see _research_core), then the card: text first, picture after.
+    kong (2026-10-13): "Text first, then ... another image capable model to find an
+    image, place the image onto the brief card, deliver it afterwards (so I can already
+    read the text)". The card stage runs after the final answer and before `done`, still
+    inside the turn, so a borrowed vision model is held under the same turn lock."""
+    state = {}
+    final = None
+    for ev in _research_core(model, messages, min_sources, effort, temperature, borrow, state):
+        if ev.get("type") == "final":
+            final = ev.get("text")
+        if ev.get("type") == "done" and final and not state.get("asked"):
+            try:
+                yield from card_stage(model, borrow or _borrow_freely, state)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                yield {"type": "card_none", "why": f"{type(e).__name__}: {e}"}
+        yield ev
+
+
+CARD_PICK_MAX = 4        # candidate photos shown to the vision model at once
+CARD_PICK_SIDE = 768     # px; enough to recognise a subject, cheap in tokens (~30 s pick)
+
+def card_stage(model, borrow, state):
+    """One card per answer, delivered after the text. A Wikipedia match is copied as is
+    (the Quill case). Otherwise up to CARD_PICK_MAX photos from pages read — charts,
+    screenshots, logos and anything sharing no key word with the question are filtered
+    out first — are shown to a vision model, which picks the one that shows the subject,
+    or none, and writes the card's lines. Tested 2026-10-13 on muse-glimmer: the Orange
+    Pi board picked in 3/3 orders over a portrait and a chart, and "none" when it was
+    absent."""
+    if not state.get("card") and state.get("card_thread"):
+        state["card_thread"].join(10)     # a lookup slower than the model's head start
+        state["card"] = state["card_box"].get("card")
+    if state.get("card"):
+        yield {"type": "card", **state["card"]}
+        return
+    qwords = card_words(state.get("question", ""))
+    seen, cands = set(), []
+    for page, figs in state.get("page_figs", {}).items():
+        for alt, src in figs:
+            sc = photo_score(alt, src, qwords) if qwords else 0
+            if sc and src not in seen:
+                seen.add(src)
+                cands.append((sc, alt, src, page))
+    if not cands:
+        why = state.get("card_box", {}).get("why")
+        if why:
+            yield {"type": "card_none", "why": why}
+        return
+    cands = sorted(cands, key=lambda c: -c[0])[:CARD_PICK_MAX]
+    yield {"type": "card_wait"}
+    import concurrent.futures as cf
+    def grab(c):
+        try:
+            return c, _image_png_b64(c[2], CARD_PICK_SIDE)[0]
+        except Exception:
+            return c, None            # slow or blocked host: that candidate just drops out
+    with cf.ThreadPoolExecutor(len(cands)) as pool:
+        got = [(c, b) for c, b in pool.map(grab, cands) if b]
+    if not got:
+        yield {"type": "card_none", "why": f"none of {len(cands)} candidate pictures downloaded"}
+        return
+    prompt = (f"A user asked: {state.get('question', '').strip()[:500]}\n"
+              f"The {len(got)} image(s) above are numbered 1 to {len(got)} in order. Pick the "
+              "ONE that best shows what the question is about — a photo of the real thing, "
+              "not a chart, screenshot, logo or unrelated person. If none plainly shows it, "
+              "pick 0.\nReply exactly:\nPICK: <number>\nCAPTION: <one or two short "
+              "sentences describing what the picked image shows>")
+    msgs = [{"role": "user", "content": prompt, "images": [b for _, b in got]}]
+    viewer = model if model_has_vision(model) else VISION_MODEL
+    out = ""
+    with (contextlib.nullcontext((True, "")) if viewer == model else borrow(viewer)) as (ok, _):
+        if not ok:
+            yield {"type": "card_none", "why": f"{viewer} not available: {_}"}
+            return
+        for kind, chunk in ollama_chat_stream(viewer, msgs, effort=False, temperature=0.3):
+            if kind == "content":
+                out += chunk
+    m = re.search(r"PICK:\s*(\d+)", out)
+    pick = int(m.group(1)) if m else 0
+    if not 1 <= pick <= len(got):
+        yield {"type": "card_none", "why": f"{viewer} found no fitting picture among "
+                                          f"{len(got)}: {out.strip()[:200]}"}
+        return
+    (_, alt, src, page), _ = got[pick - 1]
+    cap = re.search(r"CAPTION:\s*(.+)", out, re.S)
+    yield {"type": "card", "title": state.get("page_titles", {}).get(page) or alt[:90],
+           "extract": (cap.group(1).strip() if cap else alt)[:300], "image": src,
+           "url": page, "source": urllib.parse.urlparse(page).netloc.removeprefix("www."),
+           "photo": True, "by": viewer}
 
 
 def run_agent(model, messages, min_sources=MIN_SOURCES, temperature=None):

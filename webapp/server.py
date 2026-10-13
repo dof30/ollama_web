@@ -78,7 +78,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # beside anything, where 61 GB on a busy box is the difference between a slow answer
 # and a frozen machine. (Was gemma4:26b until it was removed from this box.) Override
 # with RESEARCH_MODEL.
-DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "muse-glimmer:30b")
+DEFAULT_MODEL = os.environ.get("RESEARCH_MODEL", "gpt-oss:120b")   # kong, 2026-10-13
 
 # How much request body we will read. Everything but dictation carries a few short
 # fields; a recording is up to ~90s of 16 kHz mono WAV, base64-inflated by a third.
@@ -160,18 +160,17 @@ EMBEDDING_NAME = re.compile(r"embed", re.I)
 # `ollama run` still reaches them; it is about keeping the one control you choose from down
 # to the models you actually choose between. qwen3.5 left the service on 2026-10-07: the
 # 122b is outdated beside qwen3.8:27b, and at ~81 GB it was the one model that could not
-# share the machine. What remains (muse-glimmer:30b, gpt-oss:120b) fits side by side.
+# share the machine. On 2026-10-13 every Qwen left (kong: "gpt-oss and muse glimmer should
+# be capable enough to deal with 99% of daily Q&As"); Qwen work lives in Visual Workbench,
+# Workbench and Qwen-web. What remains (muse-glimmer:30b, gpt-oss:120b) fits side by side.
 HIDDEN_MODELS = tuple(filter(None, (s.strip() for s in os.environ.get(
-    "RESEARCH_HIDE_MODELS", "qwen3.5,qwen3.8,qwen3.6").split(","))))
+    "RESEARCH_HIDE_MODELS", "qwen").split(","))))
 
-# Exact tags that survive HIDDEN_MODELS. Hiding by prefix is what lets one word retire a
-# whole family, but it cannot say "this family except this one build" — and that is the
-# shape of the Qwen decision: qwen3.8:27b joined the picker on 2026-10-10 as the only Qwen
-# anyone here chooses, while qwen3.5, qwen3.6 and every other qwen3.8 tag stay out. Exact
-# tags only, never prefixes: a prefix here would silently re-open the family the hide list
-# just closed, which is the one mistake this pair of lists exists to prevent.
+# Exact tags that survive HIDDEN_MODELS ("this family except this one build"). Empty since
+# qwen3.8:27b, the one exception (2026-10-10), left with the rest of the Qwens. Exact tags
+# only, never prefixes: a prefix here would silently re-open a family the hide list closed.
 SHOWN_MODELS = frozenset(filter(None, (s.strip() for s in os.environ.get(
-    "RESEARCH_SHOW_MODELS", "qwen3.8:27b").split(","))))
+    "RESEARCH_SHOW_MODELS", "").split(","))))
 
 # Ollama 0.40 lists a GGUF adopted from a llama.cpp install under its digest
 # ("llamacpp:6e67eb…") and can list the same tag twice, once per digest. Neither is a
@@ -502,26 +501,39 @@ def turn_lock(model):
 
 @contextlib.contextmanager
 def borrow_model(model):
-    """Load and hold a helper model for part of another model's turn -> (ok, why).
+    """Load and hold a helper model for the end of another model's turn -> (ok, why).
 
-    view_image uses this when the asking model has no vision: the helper comes in
-    through the same admission door as any load (never evicting the busy asker; refused
-    with the reason if it won't fit) and under its own turn lock, so it can't share its
-    one context slot with a tab that is answering on it. It does not become the header's
-    active model — it is a guest in this turn, not a switch."""
+    The picture card uses this after a text-only model (gpt-oss) has written its answer:
+    muse-glimmer comes in through the same admission door as any load (never evicting the
+    busy asker; refused with the reason if it won't fit) and under its own turn lock, so it
+    can't share its one context slot with a tab answering on it. It does not become the
+    header's active model — it is a guest in this turn, not a switch.
+
+    Descend: a helper this borrow had to load is unloaded again as soon as the job is
+    done. Two resident models cost GPU memory for both (kong, 2026-10-13: "a descend
+    mechanism to load and unload secondary model"). One that was already resident — a tab
+    is using it as its own model — is left as it was."""
     global ACTIVE_MODEL
     lock = turn_lock(model)
     if not lock.acquire(timeout=10):
         yield False, f"{model} is answering in another tab"
         return
+    loaded_here = False
     try:
         prev = ACTIVE_MODEL
+        loaded_here = model not in loaded_models()
         try:
             ok, why = ensure_loaded(model)
         finally:
             ACTIVE_MODEL = prev
         yield ok, ("" if ok else why["msg"])
     finally:
+        if loaded_here and model in loaded_models():
+            try:
+                unload_model(model)
+                APP_MODELS.discard(model)
+            except Exception:
+                pass          # best effort; Ollama's own keep_alive timer still bounds it
         lock.release()
 
 
@@ -1009,7 +1021,11 @@ def adopt_resident_model():
     loaded, else adopt whichever is. Best effort: if Ollama is down we keep the default."""
     global ACTIVE_MODEL
     try:
-        resident = loaded_models()
+        # Only models this app's picker offers. Another app's model (Qwen-web's qwen3.6,
+        # the embedder) must not become the header's model here — nor count as ours,
+        # or switching away would unload it from under that app.
+        offered = set(list_models())
+        resident = [m for m in loaded_models() if m in offered]
     except Exception:
         return
     if resident and DEFAULT_MODEL not in resident:
