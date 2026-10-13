@@ -19,6 +19,8 @@ import re
 import sys
 import threading
 import time
+import sqlite3
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -734,8 +736,39 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/state":
             # What is holding RAM right now, across BOTH runtimes, for the header.
             self._send(200, json.dumps(machine_state()), extra={"Cache-Control": "no-store"})
+        elif path == "/api/history" or path.startswith("/api/history/"):
+            self._history(path)
         else:
             self._send(404, json.dumps({"error": "not found"}))
+
+    def _history(self, path):
+        """The Alt+H history window: read-only, and only for this app's own page.
+
+        Until 2026-10-13 nothing here read history at all (kong's July rule: terminal
+        only). He asked for a browser behind a shortcut, keeping the page focused. The
+        Host check (do_GET) stops DNS rebinding; the custom header stops another site's
+        page from reading this through the user's browser — a cross-origin request may
+        not add it without a CORS preflight, which this server never approves. Deleting
+        stays terminal-only (history.py purge)."""
+        if self.headers.get("X-Research-History") != "1":
+            self._send(403, json.dumps({"error": "forbidden"}))
+            return
+        q = urllib.parse.parse_qs(self.path.partition("?")[2])
+        nocache = {"Cache-Control": "no-store"}
+        try:
+            if path == "/api/history":
+                body = history.browse(term=(q.get("q") or [""])[0][:200],
+                                      before=(q.get("before") or [None])[0],
+                                      limit=(q.get("limit") or [50])[0])
+            else:
+                body = history.fetch(path.rsplit("/", 1)[1])
+                if body is None:
+                    self._send(404, json.dumps({"error": "no such turn"}), extra=nocache)
+                    return
+        except (ValueError, sqlite3.Error) as e:
+            self._send(400, json.dumps({"error": f"{type(e).__name__}: {e}"}), extra=nocache)
+            return
+        self._send(200, json.dumps(body), extra=nocache)
 
     def _transcribe(self):
         """Recorded audio in (base64 WAV), text out. Dictation only: the transcript

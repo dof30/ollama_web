@@ -3,10 +3,11 @@
 history — a locked-away session recorder for the research web UI.
 
 Every finished research turn (question, answer, sources, model, timing) is
-appended to a local SQLite database. Deliberately NOT wired into the web
-frontend: the server only ever WRITES here, there is no HTTP route that reads
-it, so a browser (or anything that can talk to the port) can never pull your
-research history back out. You check it from the terminal when you want to:
+appended to a local SQLite database. It stays out of the page you work in: the
+web UI shows none of it until you ask, with a shortcut (Alt+H), for a read-only
+browser over it — kong, 2026-10-13, reversing the July "terminal only" rule while
+keeping its point, a focused page. That browser reads through browse()/fetch()
+below on a read-only connection; deleting stays terminal-only. From the terminal:
 
     python3 history.py list [N]        # the last N turns, one line each (default 20)
     python3 history.py show <id>       # one full record: question, answer, sources
@@ -19,7 +20,9 @@ Security posture (single local user, stdlib only):
   - DB lives OUTSIDE the repo and outside the served static/ dir, under
     ~/.local/share/research-web/ — it can't be committed or served by accident.
   - Directory is chmod 0700 and the DB file 0600: only your user can read it.
-  - Write-only from the web app; read path is this CLI, run as your user.
+  - The web app writes; it reads only through a read-only connection, behind a
+    Host check and a custom header another site's script cannot send. Purging is
+    never offered over HTTP — only this CLI, run as your user, deletes.
   - RESEARCH_HISTORY=0 disables recording entirely.
   - Recording is best-effort: any failure here is swallowed so it can never
     take down a research run.
@@ -93,6 +96,72 @@ def record(sid, model, depth, question, answer, sources, seconds):
         # Log to the server console and move on; the answer already streamed.
         print(f"history: failed to record turn: {type(e).__name__}: {e}",
               file=sys.stderr, flush=True)
+
+
+# ======================= web reader (read-only) ========================
+# For the history window (Alt+H). A `mode=ro` connection: even a bug in a caller
+# cannot write or delete through it, and a missing DB reads as empty instead of
+# being created by a read.
+
+def _connect_ro():
+    if not os.path.exists(DB_PATH):
+        return None
+    return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
+
+
+def _snip(text, width):
+    text = " ".join((text or "").split())
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def browse(term="", before=None, limit=50):
+    """Newest turns first, optionally matching `term` in question or answer.
+    `before` pages backwards by id. -> {"items": [...], "more": bool}"""
+    conn = _connect_ro()
+    if conn is None:
+        return {"items": [], "more": False}
+    limit = max(1, min(int(limit), 200))
+    where, args = ["1=1"], []
+    if term:
+        where.append("(question LIKE ? OR answer LIKE ?)")
+        args += [f"%{term}%"] * 2
+    if before:
+        where.append("id < ?")
+        args.append(int(before))
+    try:
+        rows = conn.execute(
+            "SELECT id, ts, model, question, answer, ok, seconds FROM turns WHERE "
+            + " AND ".join(where) + " ORDER BY id DESC LIMIT ?", args + [limit + 1]).fetchall()
+    finally:
+        conn.close()
+    items = [{"id": r[0], "ts": r[1], "model": r[2], "q": _snip(r[3], 200),
+              "a": _snip(r[4], 220), "ok": bool(r[5]), "seconds": r[6]} for r in rows[:limit]]
+    return {"items": items, "more": len(rows) > limit}
+
+
+def fetch(id_):
+    """One full turn, plus the other turns of its conversation (same sid) for context."""
+    conn = _connect_ro()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id, ts, sid, model, question, answer, sources, seconds, ok"
+            " FROM turns WHERE id = ?", (int(id_),)).fetchone()
+        if not row:
+            return None
+        thread = conn.execute(
+            "SELECT id, question FROM turns WHERE sid = ? ORDER BY id LIMIT 60",
+            (row[2],)).fetchall()
+    finally:
+        conn.close()
+    try:
+        sources = json.loads(row[6])
+    except ValueError:
+        sources = []
+    return {"id": row[0], "ts": row[1], "model": row[3], "question": row[4],
+            "answer": row[5], "sources": sources, "seconds": row[7], "ok": bool(row[8]),
+            "thread": [{"id": t[0], "q": _snip(t[1], 90)} for t in thread]}
 
 
 # ======================= terminal reader (CLI) =========================
