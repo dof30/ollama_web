@@ -546,11 +546,10 @@ TOOL_SPECS = [
     {"type": "function", "function": {
         "name": "plan",
         "description": (
-            "Say how you will answer, BEFORE your first search, and update it as parts "
-            "get settled. The user sees it live as a checklist with a progress bar — it "
-            "is how they can tell you understood them and how long is left. FREE: it "
-            "does not use a research step. Skip it only for a question you answer "
-            "straight away with no tools."),
+            "Optional: show the user how you read the question and its parts. They see "
+            "it as a checklist — it is how they can tell you understood them. Call it "
+            "again to mark a part done or not_found. FREE: it does not use a research "
+            "step. Skip it for a question you answer straight away."),
         "parameters": {"type": "object", "properties": {
             "reading": {"type": "string", "description": (
                 "the question in one clean line, as you understood it. Fix garbled or "
@@ -563,7 +562,6 @@ TOOL_SPECS = [
                     "facts); search = needs world data AND the question says what to look "
                     "up; ask = the question leaves its target open (which programme? which "
                     "year?) — ask in your answer instead of searching for random examples")},
-                "steps": {"type": "integer", "description": "research steps it still needs (0 for know/ask)"},
                 "status": {"type": "string", "enum": ["todo", "done", "not_found"]},
             }, "required": ["part", "how"]}},
         }, "required": ["reading", "parts"]},
@@ -785,7 +783,7 @@ TOOLS (call one at a time):
 - view_image    -> {"tool":"view_image","args":{"url":"https://...png","question":"what you need from it"}}
 - more_steps    -> {"tool":"more_steps","args":{"reason":"what went wrong, what you'll try next"}}
 - ask_user      -> {"tool":"ask_user","args":{"question":"Which one did you mean?","options":["...","..."]}}
-- plan          -> {"tool":"plan","args":{"reading":"the question, one clean line","parts":[{"part":"...","how":"know|search|ask","steps":1,"status":"todo|done|not_found"}]}}
+- plan          -> {"tool":"plan","args":{"reading":"the question, one clean line","parts":[{"part":"...","how":"know|search|ask","status":"todo|done|not_found"}]}}
 
 HOW TO ACT — first decide where the answer LIVES, then match your effort:
 1. FOLLOW-UPS — the conversation above is yours. When the question refers to
@@ -852,19 +850,17 @@ RULES:
 - Prefer primary sources (papers, official docs, repos) over blog summaries.
 - Use as many tool calls as the question deserves and no more. When you can
   answer with reasonable confidence, stop and answer.
-- PLAN FIRST: before your first research call, call plan (free — it costs no
-  step). The user watches it live: it is how they can tell you understood them
-  and how long is left. `reading` = the question in one clean line; dictated
-  questions arrive with misheard sound-alikes ("view con" = "view count",
-  "nameberg" = "number"), so fix them there. `parts` = the question split by
-  where each answer LIVES: know (what a word means, how to phrase something,
-  settled facts — answer these yourself, never search them), search (world
-  data, and only when the question says WHAT to look up — give an honest step
-  estimate), ask (it leaves its target open: which programme? which year? — do
-  not search for random examples; answer the rest and end with one short
-  question). Call plan again when a part is done or not found, or your
-  estimate changes. A question you answer straight away with no tools needs
-  no plan.
+- PLAN (optional, free — it costs no step): for a question with several parts,
+  call plan so the user can see how you read it. `reading` = the question in
+  one clean line; dictated questions arrive with misheard sound-alikes ("view
+  con" = "view count", "nameberg" = "number"), so fix them there. `parts` = the
+  question split by where each answer LIVES: know (what a word means, how to
+  phrase something, settled facts — answer these yourself, never search them),
+  search (world data, and only when the question says WHAT to look up), ask (it
+  leaves its target open: which programme? which year? — do not search for
+  random examples; answer the rest and end with one short question). Call plan
+  again when a part is done or not found. A question you answer straight away
+  needs no plan.
 - Your answers to the 'know' parts stand: searching adds to them, it never
   replaces them.
 - Two searches for the same thing that both come back without it are a
@@ -967,19 +963,17 @@ RULES:
 - Prefer primary sources (papers, official docs, repos) over blog summaries.
 - Use as many tool calls as the question deserves and no more. When you can
   answer with reasonable confidence, stop and answer.
-- PLAN FIRST: before your first research call, call plan (free — it costs no
-  step). The user watches it live: it is how they can tell you understood them
-  and how long is left. `reading` = the question in one clean line; dictated
-  questions arrive with misheard sound-alikes ("view con" = "view count",
-  "nameberg" = "number"), so fix them there. `parts` = the question split by
-  where each answer LIVES: know (what a word means, how to phrase something,
-  settled facts — answer these yourself, never search them), search (world
-  data, and only when the question says WHAT to look up — give an honest step
-  estimate), ask (it leaves its target open: which programme? which year? — do
-  not search for random examples; answer the rest and end with one short
-  question). Call plan again when a part is done or not found, or your
-  estimate changes. A question you answer straight away with no tools needs
-  no plan.
+- PLAN (optional, free — it costs no step): for a question with several parts,
+  call plan so the user can see how you read it. `reading` = the question in
+  one clean line; dictated questions arrive with misheard sound-alikes ("view
+  con" = "view count", "nameberg" = "number"), so fix them there. `parts` = the
+  question split by where each answer LIVES: know (what a word means, how to
+  phrase something, settled facts — answer these yourself, never search them),
+  search (world data, and only when the question says WHAT to look up), ask (it
+  leaves its target open: which programme? which year? — do not search for
+  random examples; answer the rest and end with one short question). Call plan
+  again when a part is done or not found. A question you answer straight away
+  needs no plan.
 - Your answers to the 'know' parts stand: searching adds to them, it never
   replaces them.
 - Two searches for the same thing that both come back without it are a
@@ -1308,13 +1302,14 @@ def effort_for(min_sources):
     return "low" if min_sources < 3 else "high"   # Quick (1 source) / Deep (5 sources)
 
 
-# ---------- the plan, and progress measured against it ----------
-# "step 3 of 12" told the user nothing: 12 is a ceiling, not a forecast, and a run could
-# be one step from done or lost in a loop and look the same. So the model states a plan
-# (how it read the question, the parts, a step estimate for each) and the progress line,
-# the ETA and the model's own clock all count against THAT. Going past its own estimate
-# is the discourager: either a part isn't published in that form or the plan was wrong,
-# and both have an exit that isn't "search again".
+# ---------- the plan: how the model read the question ----------
+# A checklist the user can read: the question as understood (dictation fixed) and its
+# parts, each marked know/search/ask and ticked found/not found. It used to carry a step
+# estimate per part, driving a progress bar, an ETA and "you are past your own estimate"
+# nudges — and the first research call was held until a plan arrived. Dropped 2026-10-13:
+# a model guessing its step count before reading any page is noise (planned ~1, used 5;
+# planned ~2, used 1), and the forced plan cost a turn per question, two when gpt-oss
+# sent it malformed. What stays is optional and free.
 PLAN_FREE_CALLS = int(os.environ.get("RESEARCH_PLAN_FREE_CALLS", "4"))
 PLAN_HOWS = ("know", "search", "ask")
 PLAN_STATUSES = ("todo", "done", "not_found")
@@ -1343,8 +1338,8 @@ def _plan_parts(raw):
             it = {"part": m.group(2), "how": m.group(1)} if m else {"part": it}
         if not isinstance(it, dict):
             continue
-        # gpt-oss ignores the schema's field names for its own: asked for part/how/steps
-        # it sent {"description", "type", "estimated_steps"} — so read the synonyms too,
+        # gpt-oss ignores the schema's field names for its own: asked for part/how it
+        # sent {"description", "type", ...} — so read the synonyms too,
         # and {"search": "..."} as how + part.
         pick = lambda *keys: next((it[k] for k in keys if it.get(k) not in (None, "")), "")
         short = [k for k in PLAN_HOWS if isinstance(it.get(k), str)]
@@ -1360,13 +1355,7 @@ def _plan_parts(raw):
         how = how if how in PLAN_HOWS else "search"
         status = str(it.get("status", "todo")).strip().lower().replace(" ", "_")
         status = status if status in PLAN_STATUSES else "todo"
-        try:
-            steps = int(pick("steps", "estimated_steps", "est_steps", "step_estimate")
-                        or (1 if how == "search" else 0))
-        except (TypeError, ValueError):
-            steps = 1 if how == "search" else 0
-        steps = max(0, min(steps, 8)) if how == "search" else 0
-        parts.append({"part": name, "how": how, "steps": steps, "status": status})
+        parts.append({"part": name, "how": how, "status": status})
     return parts
 
 
@@ -1452,10 +1441,8 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
     nudges = 0
     stalls = 0              # turns that returned only reasoning — no answer, no call
     searches_in_a_row = 0   # list-tool calls since the last web_fetch (loop detector)
-    plan = None             # the model's latest plan: {"reading", "parts", "expected"}
+    plan = None             # the model's latest plan: {"reading", "parts"}
     plan_calls = 0          # plan calls so far; the first PLAN_FREE_CALLS cost no step
-    plan_nagged = False     # reminded once to plan after researching without one
-    plan_demanded = False   # held the first research call once, to get the plan first
     queries = []            # (step, query) of every search run — the repeat detector
     fetch_parts = {}        # url -> last part read, so a re-fetch reads ON, not again
     page_figs = {}          # url -> [(alt, image url)] seen in its fetched parts
@@ -1519,8 +1506,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                                                    p["status"]))
                                    if p["status"] == "todo" else p for p in plan["parts"]]
                         yield {"type": "plan", "reading": plan["reading"], "parts": settled,
-                               "expected": plan["expected"], "used": step - 1,
-                               "limit": max_steps, "final": True}
+                               "used": step - 1, "final": True}
                     yield {"type": "final", "text": tidy_answer(content.strip())}
                     yield {"type": "done"}
                     return
@@ -1570,29 +1556,6 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                 yield {"type": "done"}
                 return
 
-            # --- plan before research ---
-            # Asked nicely (prompt, tool description, a reminder) gpt-oss planned only at
-            # step 2-6 of 4 test runs, so the plan the user is meant to see in the first
-            # seconds arrived a minute in. Hold the first research call instead: it does
-            # not run, the step is not charged, and the model is told why. Once only —
-            # a model that still won't plan gets to research without one.
-            if plan is None and not plan_demanded and any(t in TOOLS for t, _ in calls):
-                plan_demanded = True
-                step -= 1
-                yield {"type": "notice", "free": True,
-                       "text": "search held until the plan is up"}
-                held = ("NOT RUN YET: call plan first — it is free and the user is waiting "
-                        "to see how you read the question, its parts and how long it will "
-                        "take. Then make this call again.")
-                for t, _ in calls:
-                    if came_natively:
-                        messages.append({"role": "tool", "tool_name": t, "content": held})
-                    else:
-                        messages.append({"role": "user", "content":
-                                         f"OBSERVATION from {t}:\n{held}\n\nRespond now "
-                                         f"with a plan tool call (JSON only)."})
-                continue
-
             # --- tools were requested (a native model may batch several per turn) ---
             step_usable = False   # did anything in this step actually come back readable?
             planned_only = all(t == "plan" for t, _ in calls)
@@ -1638,35 +1601,32 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                                              f"write the FINAL ANSWER."})
                         continue
                     if tool == "plan":
-                        # Bookkeeping, not research: it sets what progress is measured
-                        # against. `expected` counts research steps (planning excluded) —
-                        # those already used plus what the open parts still need.
+                        # Bookkeeping, not research: free for the first PLAN_FREE_CALLS.
                         plan_calls += 1
                         parts = _plan_parts(args.get("parts") or args.get("steps")
                                             or args.get("plan") or args.get("items"))
                         reading = str(args.get("reading") or "").strip()[:300]
-                        if not parts:
+                        if not parts and not reading:
                             raise ValueError(
-                                "plan needs `parts`: a list of {part, how, steps, status}, "
-                                "e.g. [{\"part\": \"the term\", \"how\": \"know\"}] — you "
-                                f"sent {json.dumps(args, ensure_ascii=False)[:300]}")
+                                "plan needs `reading` and `parts`: a list of {part, how, "
+                                "status}, e.g. [{\"part\": \"the term\", \"how\": \"know\"}] "
+                                f"— you sent {json.dumps(args, ensure_ascii=False)[:300]}")
+                        # A malformed parts list ("parts": ["search"]) keeps the earlier
+                        # parts rather than costing a retry turn: the reading is the point.
+                        parts = parts or (plan or {}).get("parts", [])
                         used = step - (1 if plan_calls <= PLAN_FREE_CALLS else 0)
-                        todo = sum(p["steps"] for p in parts if p["status"] == "todo")
                         plan = {"reading": reading or (plan or {}).get("reading", ""),
-                                "parts": parts, "expected": used + todo}
+                                "parts": parts}
                         yield {"type": "plan", "reading": plan["reading"], "parts": parts,
-                               "expected": plan["expected"], "used": used,
-                               "limit": max_steps}
+                               "used": used}
                         yield {"type": "observation", "tool": tool, "n": len(parts),
-                               "ok": True, "preview": f"{len(parts)} part(s) · "
-                                                      f"~{plan['expected']} research step(s)"}
+                               "ok": True, "preview": f"{len(parts)} part(s)"}
                         open_know = [p["part"] for p in parts if p["how"] == "know"]
-                        obs = (f"Plan noted (free): {len(parts)} part(s), about "
-                               f"{plan['expected']} research step(s) in all, of which "
-                               f"{used} are used. ")
-                        # The plan call is where a model decides it is done (both muse
-                        # runs: plan, then the answer) — so unviewed figures are named here,
-                        # and "write the answer now" waits until they have been weighed.
+                        open_search = [p for p in parts
+                                       if p["how"] == "search" and p["status"] == "todo"]
+                        obs = f"Plan noted (free): {len(parts)} part(s). "
+                        # Unviewed figures are named here because the plan call is where a
+                        # model decides it is done (both muse runs: plan, then the answer).
                         unseen = [f for figs_ in page_figs.values() for f in figs_
                                   if f[1] not in viewed]
                         if unseen:
@@ -1675,7 +1635,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                                     ". If one carries a result your answer needs — for a "
                                     "page summary, the page's key chart — view_image it "
                                     "before writing. ")
-                        elif not todo:
+                        elif not open_search:
                             obs += "Nothing left to research — write the FINAL ANSWER now. "
                         if open_know:
                             obs += ("Answer the 'know' parts yourself in the answer — no "
@@ -1683,8 +1643,7 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                         if any(p["how"] == "ask" for p in parts):
                             obs += ("For the 'ask' parts, end the answer with one short "
                                     "question for the missing detail. ")
-                        obs += ("Call plan again when a part is done or not found, or "
-                                "your estimate changes.")
+                        obs += "Call plan again when a part is done or not found."
                         step_usable = True
                         if came_natively:
                             messages.append({"role": "tool", "tool_name": tool, "content": obs})
@@ -1879,34 +1838,16 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                     clock = (f"\n\n[that source gave nothing usable, so step {step + 1} was "
                              f"NOT charged — you still have {max_steps - step} of "
                              f"{max_steps} research steps. Try a different source.]")
-                elif plan:
-                    # Against the model's OWN plan, not the ceiling: "step 6, you planned
-                    # 4" is a question it can act on; "step 6 of 12" just says keep going.
-                    left = max_steps - step
-                    open_n = sum(p["status"] == "todo" and p["how"] == "search"
-                                 for p in plan["parts"])
-                    clock = (f"\n\n[progress: research step {step} · your plan expects "
-                             f"about {plan['expected']} · hard limit {max_steps} · "
-                             f"{open_n} search part(s) still open — mark each done or "
-                             f"not_found with plan as you settle it")
-                    if step > plan["expected"]:
-                        clock += (" — you are PAST your own estimate. If a part is not "
-                                  "turning up, it may not be published in that form: mark "
-                                  "it not_found with plan and write the answer. If the plan "
-                                  "was simply too small, call plan with a corrected estimate")
-                    elif left <= 3:
-                        clock += (f" — only {left} step(s) remain before the final answer "
-                                  "is forced")
-                    clock += "]"
                 else:
                     left = max_steps - step
                     clock = f"\n\n[progress: research step {step} of {max_steps}"
-                    if not plan_nagged and step >= 1:
-                        # One reminder only: a run that never plans still has to work.
-                        plan_nagged = True
-                        clock += (" — you have not called plan yet: call it now (free), so "
-                                  "the user can see how you read the question, its parts, "
-                                  "and how many steps are left")
+                    if plan:
+                        open_n = sum(p["status"] == "todo" and p["how"] == "search"
+                                     for p in plan["parts"])
+                        if open_n:
+                            clock += (f" · {open_n} search part(s) of your plan still open "
+                                      "— mark each done or not_found with plan as you "
+                                      "settle it")
                     if left <= 3:
                         # Two exits, stated together on purpose. Telling it only to
                         # converge is right when it HAS what it needs and wrong when its
@@ -1979,9 +1920,8 @@ def run_agent(model, messages, min_sources=MIN_SOURCES, temperature=None):
         elif t == "plan":
             newline()
             marks = {"done": "✓", "not_found": "✗"}
-            lines = [f"  ▤ plan · ~{ev.get('expected')} research step(s) · {ev.get('reading', '')}"]
-            lines += [f"     {marks.get(p['status'], '·')} {p['part']} ({p['how']}"
-                      f"{', ~' + str(p['steps']) if p['how'] == 'search' else ''})"
+            lines = [f"  ▤ plan · {ev.get('reading', '')}"]
+            lines += [f"     {marks.get(p['status'], '·')} {p['part']} ({p['how']})"
                       for p in ev.get("parts", [])]
             sys.stdout.write(c("\n".join(lines) + "\n", C.cyan))
             at_line_start = True

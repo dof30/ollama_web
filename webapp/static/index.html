@@ -78,9 +78,6 @@
   .plan li .how{margin-left:auto;padding-left:8px;color:var(--dim);font-size:12px;white-space:nowrap}
   .plan li.done .pm{color:var(--accent)}
   .plan li.not_found .pm,.plan li.not_found .how,.plan li.unconfirmed .how{color:var(--warn)}
-  .planbar{height:3px;background:var(--line);border-radius:2px;margin-top:8px;overflow:hidden}
-  .planbar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .4s}
-  .planbar.over>i{background:var(--warn)}
   .tracebody{padding:6px 12px 12px;font-size:13px;color:var(--ink);
         border-top:1px solid var(--line)}
   .step{margin-top:8px}
@@ -720,43 +717,23 @@ function newTurn(question){
           t0:performance.now(), tick:null};
 }
 
-// ---- progress: elapsed time, and steps/ETA against the model's own plan ----
-// "step 3 of 12" said nothing: 12 is a ceiling, not a forecast. With a plan the line
-// reads "step 3 · ~5 expected · 1:42 · ~1:10 left"; without one, step and clock only.
+// ---- progress: step number and elapsed time ----
+// The plan used to carry a step estimate driving "~5 expected · ~1:10 left" and a bar.
+// Dropped 2026-10-13: a model guessing its step count before reading anything is noise.
 const clockFmt = ms => { const s=Math.round(ms/1000); return Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); };
 function progressText(ctx){
   const el = performance.now()-ctx.t0;
-  let s = ctx.curStep ? "step "+ctx.curStep : "";
-  if(ctx.plan){
-    const exp = ctx.plan.expected;
-    s += " · ~"+exp+" expected";
-    if(ctx.curStep > exp) s += " · past plan";
-    else if(ctx.turns >= 2){
-      // Average model turn so far (planning and retries are turns too), times the
-      // research steps still planned plus the turn that writes the answer.
-      const per = el/ctx.turns, left = (exp-ctx.curStep) + 1;
-      s += " · "+clockFmt(el)+" · ~"+clockFmt(per*left)+" left";
-      return s;
-    }
-  }
-  return (s ? s+" · " : "") + clockFmt(el);
+  return (ctx.curStep ? "step "+ctx.curStep+" · " : "") + clockFmt(el);
 }
 function paintProgress(ctx){
   ctx.stepCount = progressText(ctx);
   setStatus(ctx, ctx.label);
-  if(ctx.planEl && ctx.plan){
-    const bar = ctx.planEl.querySelector(".planbar");
-    const exp = Math.max(1, ctx.plan.expected + 1);       // +1: writing the answer
-    bar.firstChild.style.width = Math.min(100, 100*ctx.curStep/exp)+"%";
-    bar.classList.toggle("over", ctx.curStep > ctx.plan.expected);
-  }
 }
 function startClock(ctx){ ctx.tick = setInterval(()=>paintProgress(ctx), 1000); }
 function stopClock(ctx){
   if(ctx.tick){ clearInterval(ctx.tick); ctx.tick=null; }
   const took = '<span class="stepcount">'+clockFmt(performance.now()-ctx.t0)+'</span>';
   if(!ctx.sum.querySelector(".stepcount")) ctx.sum.insertAdjacentHTML("beforeend", took);
-  if(ctx.planEl){ const bar=ctx.planEl.querySelector(".planbar"); bar.firstChild.style.width="100%"; }
 }
 function renderPlan(ctx){
   const p = ctx.plan;
@@ -770,12 +747,11 @@ function renderPlan(ctx){
                   : x.status==="done" ? "found" : x.status==="not_found" ? "not found"
                   : x.status==="unconfirmed" ? "no source read — from memory"
                   : x.status==="answered" ? "answered · see sources"
-                  : "search · ~"+x.steps+" step"+(x.steps===1?"":"s");
+                  : "search";
   ctx.planEl.innerHTML =
       (p.reading ? '<div class="reading"><b>Reading:</b> '+esc(p.reading)+'</div>' : "")
     + "<ul>"+p.parts.map(x => '<li class="'+x.status+'"><span class="pm">'+mark(x)+'</span>'
-        + '<span class="pt">'+esc(x.part)+'</span><span class="how">'+how(x)+'</span></li>').join("")+"</ul>"
-    + '<div class="planbar" title="research steps against the plan · hard limit '+(p.limit||"")+'"><i></i></div>';
+        + '<span class="pt">'+esc(x.part)+'</span><span class="how">'+how(x)+'</span></li>').join("")+"</ul>";
   paintProgress(ctx);
 }
 
@@ -893,7 +869,7 @@ function handle(ctx, ev){
       ctx.afterPlan = false;
       ctx.lastStep = ev.n; ctx.curStep = ev.n; ctx.turns++;
       ctx.stepCount = progressText(ctx);
-      s.innerHTML=`<span class="steplabel">step ${ev.n}${ctx.plan?" of ~"+ctx.plan.expected:""}`
+      s.innerHTML=`<span class="steplabel">step ${ev.n}`
                 + `${retry?' · retry (last source gave nothing)':''}</span>`;
       const th=document.createElement("div"); th.className="think"; s.appendChild(th);
       ctx.body.appendChild(s); ctx.stepEl=s; ctx.thinkEl=th; ctx.stepBuf="";
