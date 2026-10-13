@@ -11,6 +11,7 @@ whole run is visible live. Runs on localhost only.
 """
 
 import base64
+import contextlib
 import importlib
 import json
 import os
@@ -499,6 +500,31 @@ def turn_lock(model):
         return _turn_locks.setdefault(model, threading.Lock())
 
 
+@contextlib.contextmanager
+def borrow_model(model):
+    """Load and hold a helper model for part of another model's turn -> (ok, why).
+
+    view_image uses this when the asking model has no vision: the helper comes in
+    through the same admission door as any load (never evicting the busy asker; refused
+    with the reason if it won't fit) and under its own turn lock, so it can't share its
+    one context slot with a tab that is answering on it. It does not become the header's
+    active model — it is a guest in this turn, not a switch."""
+    global ACTIVE_MODEL
+    lock = turn_lock(model)
+    if not lock.acquire(timeout=10):
+        yield False, f"{model} is answering in another tab"
+        return
+    try:
+        prev = ACTIVE_MODEL
+        try:
+            ok, why = ensure_loaded(model)
+        finally:
+            ACTIVE_MODEL = prev
+        yield ok, ("" if ok else why["msg"])
+    finally:
+        lock.release()
+
+
 def busy_models():
     """Models with a research turn in flight right now; never evicted, never unloaded."""
     with _turn_locks_guard:
@@ -944,7 +970,7 @@ class Handler(BaseHTTPRequestHandler):
                 emit({"type": "done"})
                 return
             for ev in engine.research_events(model, work, min_sources=depth, effort=effort,
-                                             temperature=temperature):
+                                             temperature=temperature, borrow=borrow_model):
                 if ev.get("type") == "final":
                     final_text = ev.get("text", "")
                 elif ev.get("type") == "source":

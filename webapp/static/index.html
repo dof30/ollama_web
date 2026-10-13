@@ -100,7 +100,27 @@
   .askopts button.picked{color:var(--accent)}
   .src a{color:var(--link);text-decoration:none;word-break:break-all}
   .src a:hover{text-decoration:underline}
-  .answer{margin-top:12px}
+  .answer{margin-top:12px;display:flow-root}
+  /* The pocket: an encyclopedia card and the figures from pages the model read, floated
+     beside the answer like a Wikipedia infobox, so the text wraps around it. */
+  .pocket{float:right;width:232px;margin:2px 0 10px 18px;display:flex;flex-direction:column;gap:10px}
+  .kcard,.fig{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .kcard img{display:block;width:100%;max-height:260px;object-fit:cover;background:var(--chip)}
+  .kcard .kb{padding:9px 11px 10px}
+  .kcard .kt{font-weight:600;margin-bottom:3px}
+  .kcard .kx{font-size:.88em;line-height:1.45;color:var(--ink);display:-webkit-box;
+             -webkit-line-clamp:9;-webkit-box-orient:vertical;overflow:hidden}
+  .kcard a,.fig a{color:var(--link);font-size:.85em}
+  .gallery{display:flex;flex-direction:column;gap:8px}
+  .gallery .gh{font-size:.78em;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+  .fig img{display:block;width:100%;max-height:200px;object-fit:contain;background:#fff;cursor:zoom-in}
+  .fig .fc{padding:5px 9px 7px;font-size:.8em;color:var(--dim);line-height:1.35}
+  .fig .seen{color:var(--accent);font-weight:600}
+  #lightbox{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.82);display:flex;
+            align-items:center;justify-content:center;padding:16px;cursor:zoom-out}
+  #lightbox img{max-width:96vw;max-height:88vh;background:#fff;border-radius:6px}
+  #lightbox .lc{position:absolute;bottom:14px;left:16px;right:16px;text-align:center;color:#eee;font-size:.9em}
+  @media (max-width:640px){ .pocket{float:none;width:auto;margin:0 0 12px} .kcard img{max-height:200px} }
   .answer h1,.answer h2,.answer h3{font-size:1.05em;margin:1em 0 .3em}
   .answer p{margin:.5em 0}
   .answer ul,.answer ol{margin:.4em 0 .4em 1.3em;padding:0}
@@ -393,8 +413,8 @@ saveStore();
 // it says another live tab has it, this tab starts its own thread. The turns it shows
 // stay, and go up as `restore`, so the new thread remembers exactly what is on screen.
 function rotateSid(){ store.sid = crypto.randomUUID(); sid = store.sid; saveStore(); }
-function rememberTurn(q, a){
-  store.turns.push({q, a});
+function rememberTurn(q, a, pocket){
+  store.turns.push(pocket ? {q, a, pocket} : {q, a});
   if(store.turns.length > KEEP_TURNS) store.turns = store.turns.slice(-KEEP_TURNS);
   saveStore();
 }
@@ -596,6 +616,61 @@ function addAskButtons(ansEl, opts){
   ansEl.appendChild(box);
 }
 
+// ---- the pocket: encyclopedia card + figures, floated beside the answer ----
+// holder: {card, figs}. Rebuilt whole on every change — it is a handful of nodes — and
+// always put back first in the answer, since the final answer replaces its contents.
+function paintPocket(ansEl, holder){
+  let pk = ansEl.querySelector(":scope > .pocket");
+  if(!holder.card && !(holder.figs||[]).some(f => !f.dead)){ if(pk) pk.remove(); return; }
+  if(!pk){ pk = document.createElement("aside"); pk.className = "pocket"; }
+  ansEl.insertBefore(pk, ansEl.firstChild);
+  pk.innerHTML = "";
+  const c = holder.card;
+  if(c){
+    const k = document.createElement("div"); k.className = "kcard";
+    if(c.image){ const im = document.createElement("img"); im.src = c.image; im.alt = c.title;
+                 im.loading = "lazy"; im.onerror = () => im.remove(); k.appendChild(im); }
+    const b = document.createElement("div"); b.className = "kb";
+    b.innerHTML = '<div class="kt">'+esc(c.title)+'</div><div class="kx">'+esc(c.extract)+'</div>'
+      + (c.url ? '<a href="'+esc(c.url)+'" target="_blank" rel="noopener">Continued in '+esc(c.source||"Wikipedia")+' ›</a>' : "");
+    k.appendChild(b); pk.appendChild(k);
+  }
+  const figs = holder.figs || [];
+  if(figs.some(f => !f.dead)){
+    const g = document.createElement("div"); g.className = "gallery";
+    g.innerHTML = '<div class="gh">Figures from the pages read</div>';
+    figs.filter(f => !f.dead).forEach(f => {
+      const d = document.createElement("div"); d.className = "fig";
+      // Not lazy: the 20 s deadline below would otherwise fire on a chart that simply
+      // hadn't been scrolled to yet. There are at most 8.
+      const im = document.createElement("img"); im.alt = f.caption;
+      im.referrerPolicy = "no-referrer";    // hotlink-guarded hosts serve when no referrer is sent
+      // Blocked or gone: drop it rather than show a hole. A host that never answers (Aliyun
+      // OSS from here) raises no error at all — the image just stays "loading" — so it
+      // gets 20 s. `dead` keeps a repaint from bringing it back.
+      const drop = () => { f.dead = true; d.remove(); };
+      im.onerror = drop; im.src = f.url;     // referrerPolicy must be set before src
+      setTimeout(() => { if(!im.naturalWidth) drop(); }, 20000);
+      im.onclick = () => openLightbox(f.url, f.caption);
+      const cap = document.createElement("div"); cap.className = "fc";
+      cap.innerHTML = esc(f.caption || "figure")
+        + (f.viewed ? ' · <span class="seen" title="the model looked at this one">read by '+esc((f.by||"model").split(":")[0])+'</span>' : "")
+        + ' · <a href="'+esc(f.url)+'" target="_blank" rel="noopener">open</a>';
+      d.appendChild(im); d.appendChild(cap); g.appendChild(d);
+    });
+    pk.appendChild(g);
+  }
+}
+function openLightbox(url, caption){
+  const lb = document.createElement("div"); lb.id = "lightbox";
+  lb.innerHTML = '<img referrerpolicy="no-referrer" src="'+esc(url)+'" alt="">'
+               + (caption ? '<div class="lc">'+esc(caption)+'</div>' : "");
+  const close = () => { lb.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = e => { if(e.key === "Escape") close(); };
+  lb.onclick = close; document.addEventListener("keydown", onKey);
+  document.body.appendChild(lb);
+}
+
 function addCopyBar(ansEl, text){
   const bar=document.createElement("div"); bar.className="answerbar";
   const b=document.createElement("button"); b.textContent="Copy";
@@ -609,7 +684,7 @@ function addCopyBar(ansEl, text){
 // A turn replayed from this tab's store: question + answer, no trace. The reasoning
 // steps are deliberately not stored — the server discards that bulk after each turn
 // too (commit_turn), so what the page shows matches what the model still remembers.
-function renderSaved(q, a){
+function renderSaved(q, a, pocket){
   const t=document.createElement("div"); t.className="turn";
   const u=document.createElement("div"); u.className="user"; u.textContent=q;
   const ed=document.createElement("button"); ed.className="edit"; ed.textContent="✎ edit";
@@ -618,6 +693,7 @@ function renderSaved(q, a){
   u.appendChild(ed);
   const ans=document.createElement("div"); ans.className="answer";
   ans.innerHTML=markdown(a); addCopyBar(ans, a);
+  if(pocket) paintPocket(ans, pocket);
   t.appendChild(u); t.appendChild(ans); turns.appendChild(t);
 }
 
@@ -640,7 +716,7 @@ function newTurn(question){
   return {t, trace, sum, body, ans, stream,
           stepEl:null, thinkEl:null, srcEl:null, stepBuf:"", loadTimer:null,
           answering:false, ansLive:null, lastStep:null, stepCount:"", label:"thinking…",
-          plan:null, planEl:null, afterPlan:false, curStep:0, turns:0,
+          plan:null, planEl:null, afterPlan:false, curStep:0, turns:0, card:null, figs:[],
           t0:performance.now(), tick:null};
 }
 
@@ -758,7 +834,8 @@ async function ask(question, retried=false, warmup=false){
       // tab still shows the conversation, so the model must get it back too or the
       // next follow-up answers out of nowhere.
       body: JSON.stringify({q:question, model, effort, sid, tab: tabId,
-                            temp: Number($("#temp").value), restore: store.turns}),
+                            temp: Number($("#temp").value),
+                            restore: store.turns.map(t => ({q: t.q, a: t.a}))}),
       signal: controller.signal,
     });
     if(resp.status === 409){
@@ -789,7 +866,8 @@ async function ask(question, retried=false, warmup=false){
     if(e.name!=="AbortError"){ ctx.stream.textContent = "connection error: "+e.message; }
   }finally{
     clearLoad(ctx); stopClock(ctx);
-    if(finalText) rememberTurn(question, finalText);   // survive reload / other tabs
+    if(finalText) rememberTurn(question, finalText,   // survive reload / other tabs
+                               (ctx.card || ctx.figs.length) ? {card: ctx.card, figs: ctx.figs} : null);
     sendMode("send"); runEnded=performance.now();
     controller=null; $("#q").focus();
     refreshState();    // answering may have pulled the model in — say so straight away
@@ -856,7 +934,8 @@ function handle(ctx, ev){
       // Keep whatever prose already rendered (park it in the trace), then continue.
       parkDraft(ctx);
       ctx.stepBuf=""; ctx.answering=false;
-      setStatus(ctx, (ev.tool==="web_fetch"?"reading a page":"searching")+(ev.label?" · "+ev.label:"")+"…");
+      setStatus(ctx, (ev.tool==="web_fetch"?"reading a page":ev.tool==="view_image"?"looking at a figure"
+                      :"searching")+(ev.label?" · "+ev.label:"")+"…");
       const c=document.createElement("span"); c.className="chip tool";
       c.textContent = `⚙ ${ev.tool}(${ev.label||""})`;
       (ctx.stepEl||ctx.body).appendChild(c); break;
@@ -897,9 +976,21 @@ function handle(ctx, ev){
       // them as buttons rather than as the bullet list its text carries.
       ctx.askQ = ev.question; ctx.askOpts = ev.options || []; break;
     }
+    case "card":{
+      ctx.card = {title:ev.title, extract:ev.extract, image:ev.image, url:ev.url, source:ev.source};
+      paintPocket(ctx.ans, ctx); break;
+    }
+    case "figure":{
+      // One entry per image: a later view of the same chart only marks it as read.
+      const f = ctx.figs.find(x => x.url === ev.url);
+      if(f){ if(ev.viewed){ f.viewed = true; f.by = ev.by; } }
+      else if(ctx.figs.length < 8) ctx.figs.push({url:ev.url, caption:ev.caption||"", viewed:!!ev.viewed, by:ev.by||""});
+      paintPocket(ctx.ans, ctx); break;
+    }
     case "final":{
       const opts = ctx.askOpts || [];
       ctx.ans.innerHTML = markdown(opts.length ? ctx.askQ : ev.text);
+      paintPocket(ctx.ans, ctx);           // innerHTML just wiped it
       if(opts.length) addAskButtons(ctx.ans, opts);
       addCopyBar(ctx.ans, ev.text);
       setDone(ctx,true); return ev.text;
@@ -1645,7 +1736,7 @@ addEventListener("pagehide", speakStop);
 // The status line names THIS tab's model, read from the picker, so its first render must
 // wait for the picker to be filled — refreshState() at load runs before that and would
 // show "— not loaded" for up to one 10s refresh.
-loadModels().then(() => { store.turns.forEach(t => renderSaved(t.q, t.a)); stickToBottom();
+loadModels().then(() => { store.turns.forEach(t => renderSaved(t.q, t.a, t.pocket)); stickToBottom();
                           refreshState(); });
 $("#q").focus();
 </script>

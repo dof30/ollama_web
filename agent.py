@@ -19,6 +19,7 @@ Usage:
 REPL commands:  /model <name>   /reset   /exit
 """
 
+import contextlib
 import datetime
 import json
 import os
@@ -41,6 +42,15 @@ NUM_CTX       = int(os.environ.get("RESEARCH_NUM_CTX", "32768"))  # headroom for
 MAX_STEPS     = int(os.environ.get("RESEARCH_MAX_STEPS", "12"))
 FETCH_CHARS   = int(os.environ.get("RESEARCH_FETCH_CHARS", "6000"))
 FETCH_MAX_BYTES = 4 * 1024 * 1024   # a page bigger than this is read only this far
+# view_image: a model with vision looks at the picture itself; one without (gpt-oss) has
+# it read by this helper, whose text transcription comes back as the observation.
+# Measured on a log-scale KLD chart (2026-10-13): muse-glimmer read every asked-for
+# point right and spotted the outlier (~2 min); qwen3.6 was 4x faster but put points at
+# the wrong size and invented one; qwen3.8 missed a whole series. Wrong numbers cost
+# more than slow ones. At 17 GB it also fits beside gpt-oss.
+VISION_MODEL  = os.environ.get("RESEARCH_VISION_MODEL", "muse-glimmer:30b")
+IMAGE_MAX_SIDE = 1600               # px; bigger images are scaled down before viewing
+IMAGE_MAX_BYTES = 20 * 1024 * 1024
 MIN_SOURCES   = int(os.environ.get("RESEARCH_MIN_SOURCES", "0"))  # 0 = no gate, model decides; --deep/--depth to force
 MAX_NUDGES    = int(os.environ.get("RESEARCH_MAX_NUDGES", "4"))   # times we push it to go deeper
 # Default sampling temperature. 1.0 is OpenAI's recommendation for gpt-oss — see
@@ -212,6 +222,33 @@ def web_search(query, max_results=5):
         _attach_previews(out[:SEARCH_PREVIEW_N])
     return out
 
+_FIGURE_WORDS = re.compile(r"chart|plot|graph|figure|fig[-_ ]?\d|bench|score|result|"
+                           r"diagram|table|curve|comparison|perf", re.I)
+
+def _image_marker(img, page_url):
+    """'[image: alt — url, WxH]' for an image worth mentioning, else None.
+    Logos, badges, avatars and icons are noise; an image with alt text, or one whose
+    file name says figure/chart/benchmark, is kept. The marker is only a pointer —
+    whether the picture matters for the question is the model's call (view_image)."""
+    src = img.get("src") or img.get("data-src") or ""
+    if not src or src.startswith("data:"):
+        return None
+    src = urllib.parse.urljoin(page_url, src)
+    alt = (img.get("alt") or img.get("title") or "").strip()
+    name = urllib.parse.unquote(urllib.parse.urlparse(src).path.rsplit("/", 1)[-1])
+    if re.search(r"shields\.io|badge|avatar|logo|icon|emoji|button|sprite|pixel", src + " " + alt, re.I):
+        return None
+    try:
+        w, h = int(img.get("width") or 0), int(img.get("height") or 0)
+    except ValueError:
+        w = h = 0
+    if 0 < max(w, h) < 120:
+        return None                       # declared tiny: an icon, not a figure
+    if not alt and not _FIGURE_WORDS.search(name):
+        return None
+    size = f", {w}x{h}" if w and h else ""
+    return f"[image: {alt or name} — {src}{size}]"
+
 def web_fetch(url, part=1):
     """Download a page and return its readable text, FETCH_CHARS at a time.
     `part` 2, 3, ... is the next stretch of the same page: the research loop asks for it
@@ -255,6 +292,13 @@ def web_fetch(url, part=1):
     soup = BeautifulSoup(resp.content, "lxml")
     for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "form", "aside"]):
         tag.decompose()
+    # get_text() drops images silently, so a page whose key result is a chart read as
+    # if the chart weren't there (HF KLD-vs-size plot, 2026-10-13). Leave a marker the
+    # model can act on with view_image: alt text, link, and size when the page says.
+    for img in soup.find_all("img"):
+        marker = _image_marker(img, resp.url or url)
+        if marker:
+            img.replace_with(f"\n{marker}\n")
     title = (soup.title.string.strip() if soup.title and soup.title.string else "")
     text = re.sub(r"\n\s*\n+", "\n\n", soup.get_text("\n"))
     text = re.sub(r"[ \t]+", " ", text).strip()
@@ -277,6 +321,181 @@ def web_fetch(url, part=1):
         body += (f"\n...[page continues — web_fetch the same URL again to read "
                  f"part {part + 1} of {total}]")
     return f"TITLE: {title}\nURL: {url}{where}\n\n{body}"
+
+VIEW_PROMPT = """You are the eyes of a research assistant that cannot see images. It asks:
+{question}
+
+Answer from the picture, briefly (under 200 words):
+- First line: what it is (bar chart, line plot, table, diagram, photo) and its title.
+- Then the answer, with numbers read off the image. Read values against the
+  gridlines and axis labels — note a logarithmic axis — and mark readings
+  approximate (~). Name points by their printed labels.
+- Then anything in the image that changes the answer: an outlier, a series that
+  breaks the trend, a footnote.
+Report only what is in the image. If something is too small to read, say so."""
+
+
+def _image_png_b64(url):
+    """Download an image and return (base64 PNG, (w, h)), ready for Ollama's `images`.
+    Re-encoded as PNG because Ollama decodes only a few formats (no WebP/AVIF/GIF on
+    every build), flattened onto white because a transparent chart becomes black-on-
+    black once alpha is dropped, and scaled to IMAGE_MAX_SIDE so a 4000px screenshot
+    doesn't spend thousands of context tokens on detail no model reads."""
+    import base64, io
+    import requests
+    from PIL import Image
+    deadline = time.time() + 25
+    resp = requests.get(url, headers={"User-Agent": UA}, timeout=(10, 10), stream=True)
+    resp.raise_for_status()
+    data = bytearray()
+    for chunk in resp.iter_content(65536):
+        data += chunk
+        if time.time() > deadline:
+            raise TimeoutError(f"{url} took longer than 25s to send the image")
+        if len(data) > IMAGE_MAX_BYTES:
+            raise UnusableSource(f"{url} is over {IMAGE_MAX_BYTES >> 20} MB — too big to view.")
+    ctype = resp.headers.get("content-type", "").lower()
+    if "svg" in ctype or bytes(data[:256]).lstrip().startswith(b"<"):
+        raise UnusableSource(
+            f"{url} is not a picture view_image can open ({ctype or 'markup'}; SVG and HTML "
+            "pages are not supported). If it is a page, web_fetch it instead.")
+    try:
+        im = Image.open(io.BytesIO(bytes(data)))
+        im.seek(0)                        # first frame of an animation
+        im.load()
+    except Exception:
+        raise UnusableSource(f"{url} is not an image ({ctype or 'unknown type'}).")
+    if max(im.size) < 64:
+        raise UnusableSource(f"{url} is a {im.size[0]}x{im.size[1]} icon — nothing to read.")
+    if im.mode in ("RGBA", "LA", "P"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, "white")
+        bg.paste(im, mask=im.split()[-1])
+        im = bg
+    else:
+        im = im.convert("RGB")
+    im.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE))
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return base64.b64encode(buf.getvalue()).decode(), im.size
+
+
+def view_image(url, question, viewer):
+    """Have `viewer` (a vision model) read one image; return its account as text.
+    A one-shot request in a fresh context: the picture's tokens are spent once, here,
+    instead of riding along in the research conversation for every later step, and a
+    text-only asker (gpt-oss) gets the same thing a vision asker does. Thinking off
+    and a cool temperature: this is transcription, not deliberation, and neither
+    setting reloads the runner (see chat_options)."""
+    if not url.startswith(("http://", "https://")):
+        raise UnusableSource(f"{url!r} is not an image URL — use the link from an [image: ...] marker.")
+    b64, (w, h) = _image_png_b64(url)
+    msgs = [{"role": "user", "images": [b64], "content": VIEW_PROMPT.format(
+        question=question.strip() or "what the image shows")}]
+    text = ""
+    for kind, chunk in ollama_chat_stream(viewer, msgs, effort=False, temperature=0.3):
+        if kind == "content":
+            text += chunk
+    if not text.strip():
+        raise UnusableSource(f"{viewer} returned nothing for {url} — work from the page text.")
+    return f"IMAGE: {url} ({w}x{h}), read by {viewer}\n\n{text.strip()}"
+
+
+# ---------- encyclopedia card ----------
+# A "what is X" question has a settled answer that an encyclopedia already states, with a
+# picture — the card Firefox shows for a Wikipedia term (kong, 2026-10-13: "at least one
+# image to the page"). Looked up by the loop itself before the first turn, never by the
+# model: about a second, no research step, and no relying on gpt-oss to call a tool it
+# wasn't forced into. Shown only when the article's title is plainly what the question
+# names, so a long question that merely mentions "BBC" doesn't get a BBC card.
+WIKI_UA = "research-web/1.0 (local research assistant)"
+_CJK = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]")
+
+def _wiki_lang(text):
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "ja"
+    if re.search(r"[\uac00-\ud7af]", text):
+        return "ko"
+    return "zh" if _CJK.search(text) else "en"
+
+def _words(text):
+    """Lower-case word set, with a trailing plural 's' also counted as its singular."""
+    ws = set(re.findall(r"[a-z0-9]+", text.lower()))
+    return ws | {w[:-1] for w in ws if len(w) > 3 and w.endswith("s")}
+
+def _names_title(title, question, qwords):
+    if _CJK.search(title):
+        return re.sub(r"\s*[(（].*?[)）]", "", title) in question
+    tw = re.findall(r"[a-z0-9]+", re.sub(r"\s*\(.*?\)", "", title).lower())
+    if not tw or not set(tw) <= qwords:
+        return False
+    # A bare acronym ("BBC", "TV") is the subject of a short question, not a long one.
+    return not (len(tw) == 1 and len(tw[0]) <= 3 and len(qwords) > 6)
+
+# Question words around the subject: "what is a quill" names the article "quill".
+_ASK_WORDS = set("""what whats who whom whose which is are was were be a an the of do does did
+tell me about explain define definition meaning means describe please can could would you
+your i we my know give brief overview summary on for to in and or any some""".split())
+_ZH_ASK = re.compile(r"(什么是|是什么|是谁|是什麼|什麼是|介绍一下|介紹一下|请问|請問|的意思|吗|嗎|呢|[？?。！!，,])")
+_CARD_CACHE = {}
+
+def _subject(q):
+    """The term a question names: question words and punctuation stripped."""
+    if _CJK.search(q):
+        return _ZH_ASK.sub("", q).strip()
+    ws = re.findall(r"[A-Za-z0-9][A-Za-z0-9'\-.]*", q)
+    core = [w for w in ws if w.lower().strip("'") not in _ASK_WORDS]
+    return " ".join(core).rstrip(".")
+
+def _wiki_summary(api, title):
+    import requests
+    r = requests.get(api + "/api/rest_v1/page/summary/" + urllib.parse.quote(title.replace(" ", "_")),
+                     headers={"User-Agent": WIKI_UA}, timeout=4)
+    return r.json() if r.status_code == 200 else None
+
+def encyclopedia_card(question):
+    """{title, extract, image, url, source, lang} for the article the question names, or None.
+    Silent on every failure: a missing card costs nothing, a slow one would cost the
+    user's first second, so each request is held to a few seconds. Frugal on purpose:
+    Wikimedia answers a burst of anonymous calls with 429, so the direct title lookup
+    (one call) comes first, search only after it, and answers are cached."""
+    import requests
+    q = re.sub(r"https?://\S+", " ", question).strip()
+    if not q or q != question.strip() and len(q.split()) < 3:
+        return None                       # "summarize <url>" is about the page, not a term
+    lang = _wiki_lang(q)
+    api = f"https://{lang}.wikipedia.org"
+    subj = _subject(q)
+    if not subj:
+        return None
+    key = (lang, subj.lower())
+    if key in _CARD_CACHE:
+        return _CARD_CACHE[key]
+    d = None
+    try:
+        if len(subj.split()) <= 4:        # short enough to be an article title itself
+            d = _wiki_summary(api, subj)
+            if d and d.get("type") == "disambiguation":
+                _CARD_CACHE[key] = None   # "mercury": several articles — don't guess one
+                return None
+        if not d or d.get("type") != "standard":
+            hits = requests.get(api + "/w/api.php", headers={"User-Agent": WIKI_UA}, timeout=4,
+                                params={"action": "query", "list": "search", "srsearch": subj[:250],
+                                        "srlimit": 6, "format": "json"}).json()["query"]["search"]
+            qwords = _words(q)
+            title = next((h["title"] for h in hits if _names_title(h["title"], q, qwords)), None)
+            d = _wiki_summary(api, title) if title else None
+    except Exception:
+        return None                       # not cached: a 429 or timeout may pass
+    card = None
+    if d and d.get("type") == "standard" and d.get("extract"):
+        card = {"title": d.get("title", subj), "extract": d["extract"],
+                "image": (d.get("thumbnail") or {}).get("source", ""),
+                "url": ((d.get("content_urls") or {}).get("desktop") or {}).get("page", ""),
+                "source": "Wikipedia", "lang": lang}
+    _CARD_CACHE[key] = card
+    return card
+
 
 def arxiv_search(query, max_results=5):
     """Search arXiv. Returns a list of {title, url, authors, summary}."""
@@ -313,6 +532,9 @@ TOOLS = {
     "web_search":   lambda a: web_search(a.get("query", ""), a.get("max_results", 5)),
     "web_fetch":    lambda a: web_fetch(a.get("url", "")),
     "arxiv_search": lambda a: arxiv_search(a.get("query", ""), a.get("max_results", 5)),
+    # Needs to know which model is asking, so research_events runs it itself; this
+    # entry is what makes it a known tool name.
+    "view_image":   lambda a: (_ for _ in ()).throw(ValueError("view_image runs in the research loop")),
 }
 
 # The same three tools as JSON-schema specs for Ollama's NATIVE tool-calling API.
@@ -362,6 +584,19 @@ TOOL_SPECS = [
         }, "required": ["url"]},
     }},
     {"type": "function", "function": {
+        "name": "view_image",
+        "description": (
+            "Look at one image from a page you fetched — the [image: ...] markers in "
+            "web_fetch text — and get back what it shows: its text, axes, legend, and "
+            "the data read off it as numbers. Use it when the answer is IN a figure "
+            "(benchmark chart, plot, diagram, table screenshot), not for logos or photos."),
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "the image URL from the [image: ...] marker"},
+            "question": {"type": "string", "description": (
+                "what you need from it, e.g. 'KLD for each Unsloth quant at its size'")},
+        }, "required": ["url", "question"]},
+    }},
+    {"type": "function", "function": {
         "name": "arxiv_search",
         "description": "Search arXiv for papers. Returns titles, URLs, authors and abstracts.",
         "parameters": {"type": "object", "properties": {
@@ -404,22 +639,29 @@ TOOL_SPECS = [
     }},
 ]
 
-_TOOLS_CAP = {}  # model name -> bool, probed once per process
+_CAPS = {}  # model name -> its Ollama capabilities, probed once per process
 
-def model_supports_tools(model):
-    """True if Ollama reports native tool-calling capability for this model.
+def model_caps(model):
+    """What Ollama says this model can do ("tools", "vision", "thinking", ...).
     Conservative: any failure (old Ollama without `capabilities`, unknown model,
-    Ollama down) means False and we use the in-band JSON protocol instead."""
-    if model not in _TOOLS_CAP:
+    Ollama down) means none, so tools fall back to the in-band JSON protocol and
+    images go to the helper. A failure is not cached, so a model pulled later is seen."""
+    if model not in _CAPS:
         try:
             body = json.dumps({"model": model, "name": model}).encode()  # old Ollama wants "name"
             req = urllib.request.Request(OLLAMA_HOST + "/api/show", data=body,
                                          headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=5) as r:
-                _TOOLS_CAP[model] = "tools" in (json.load(r).get("capabilities") or [])
+                _CAPS[model] = set(json.load(r).get("capabilities") or [])
         except Exception:
-            _TOOLS_CAP[model] = False
-    return _TOOLS_CAP[model]
+            return set()
+    return _CAPS[model]
+
+def model_supports_tools(model):
+    return "tools" in model_caps(model)
+
+def model_has_vision(model):
+    return "vision" in model_caps(model)
 
 # ========================================================================
 # SYSTEM PROMPT
@@ -540,6 +782,7 @@ TOOLS (call one at a time):
 - web_search    -> {"tool":"web_search","args":{"query":"...","max_results":5}}
 - web_fetch     -> {"tool":"web_fetch","args":{"url":"https://..."}}
 - arxiv_search  -> {"tool":"arxiv_search","args":{"query":"...","max_results":5}}
+- view_image    -> {"tool":"view_image","args":{"url":"https://...png","question":"what you need from it"}}
 - more_steps    -> {"tool":"more_steps","args":{"reason":"what went wrong, what you'll try next"}}
 - ask_user      -> {"tool":"ask_user","args":{"question":"Which one did you mean?","options":["...","..."]}}
 - plan          -> {"tool":"plan","args":{"reading":"the question, one clean line","parts":[{"part":"...","how":"know|search|ask","steps":1,"status":"todo|done|not_found"}]}}
@@ -585,6 +828,11 @@ HOW TO ACT — first decide where the answer LIVES, then match your effort:
    web_fetch for the OTHER results (the ones with only a snippet), or to read a
    previewed page in full when the preview cuts off mid-point.
    For a quick lookup, one good source is enough.
+   Fetched text marks pictures as [image: alt — url]. Text alone misses what a
+   figure shows: when the question's answer, or a page summary's key result,
+   sits in a chart, plot, benchmark figure or diagram, call view_image on it
+   rather than guessing from the caption — and say in the answer what the
+   figure shows. Skip logos, photos and decoration.
 8. Save the thorough treatment (several searches from different angles,
    multiple independent sources, cross-checking) for when the user explicitly
    asks for deep research or the stakes clearly demand it.
@@ -652,7 +900,7 @@ RULES:
 # the model in two directions at once.
 SYSTEM_NATIVE = """You are a research assistant running locally on the user's machine.
 You can reach the LIVE internet through the tools provided (web_search, web_fetch,
-arxiv_search). Your knowledge of the WORLD is frozen and may be outdated — for
+arxiv_search, view_image). Your knowledge of the WORLD is frozen and may be outdated — for
 facts out there (current events, versions, products, prices, other people's
 work) use the tools rather than guess. Your REASONING is not frozen: problems
 that can be solved by thinking are yours to solve, and no tool can do it for you.
@@ -695,6 +943,11 @@ HOW TO ACT — first decide where the answer LIVES, then match your effort:
    web_fetch for the OTHER results (the ones with only a snippet), or to read a
    previewed page in full when the preview cuts off mid-point.
    For a quick lookup, one good source is enough.
+   Fetched text marks pictures as [image: alt — url]. Text alone misses what a
+   figure shows: when the question's answer, or a page summary's key result,
+   sits in a chart, plot, benchmark figure or diagram, call view_image on it
+   rather than guessing from the caption — and say in the answer what the
+   figure shows. Skip logos, photos and decoration.
 8. Save the thorough treatment (several searches from different angles,
    multiple independent sources, cross-checking) for when the user explicitly
    asks for deep research or the stakes clearly demand it.
@@ -796,7 +1049,7 @@ def ollama_chat_stream(model, messages, tools=None, effort=None, temperature=Non
         payload["keep_alive"] = ka
     if tools:
         payload["tools"] = tools
-    if effort:                  # else the model's template default (medium)
+    if effort is not None:      # else the model's template default (medium); False = off
         payload["think"] = effort
     req = urllib.request.Request(
         OLLAMA_HOST + "/api/chat", data=json.dumps(payload).encode(),
@@ -1147,7 +1400,14 @@ def _repeats(query, earlier):
     return hits
 
 
-def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, temperature=None):
+@contextlib.contextmanager
+def _borrow_freely(model):
+    """Default for `borrow` (the CLI): no admission control here, just try."""
+    yield True, ""
+
+
+def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, temperature=None,
+                    borrow=None):
     """The research loop as a STREAM OF EVENTS — the single source of truth behind
     both the terminal renderer (run_agent) and the web UI (webapp/engine.py). It
     drives the ReAct tool loop, mutating `messages` in place so follow-ups keep
@@ -1158,7 +1418,12 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
     Tool protocol is chosen per model: native Ollama tool calling when the model
     supports it (calls arrive parsed, in the channel the model was trained on),
     otherwise the original in-band JSON protocol. The in-band parser also stays on
-    as a safety net in native mode, catching a model that writes JSON as text."""
+    as a safety net in native mode, catching a model that writes JSON as text.
+
+    borrow(name) is a context manager yielding (ok, why): it makes a helper model
+    resident and holds it for view_image when the asking model has no vision. The web
+    server passes one that goes through its RAM admission and per-model turn locks."""
+    borrow = borrow or _borrow_freely
     native = model_supports_tools(model)
     # The web UI names the level outright; the CLI only says how many sources it
     # wants, so infer one from that.
@@ -1170,7 +1435,16 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
     # system message (every working copy starts from it).
     if messages and messages[0].get("role") == "system":
         messages[0]["content"] = system_prompt(native)
+    question = messages[-1]["content"] if messages and messages[-1].get("role") == "user" else ""
     stamp_current_question(messages)  # date lands next to the question, where attention is
+    card = encyclopedia_card(question) if question else None
+    if card:
+        yield {"type": "card", **card}
+        # The model gets the same text the user sees, as a free source it may lean on:
+        # a "What" question can then be answered without spending a research step.
+        messages[-1]["content"] += (f"\n[encyclopedia, shown to the user above your answer — "
+                                    f"Wikipedia, \"{card['title']}\" ({card['url']}): "
+                                    f"{card['extract']}]")
     if min_sources > 0:
         stamp_deep_brief(messages, min_sources)  # deep mode: collect first, conclude once
     read_domains = set()    # distinct sites actually fetched — this is our "depth"
@@ -1184,6 +1458,8 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
     plan_demanded = False   # held the first research call once, to get the plan first
     queries = []            # (step, query) of every search run — the repeat detector
     fetch_parts = {}        # url -> last part read, so a re-fetch reads ON, not again
+    page_figs = {}          # url -> [(alt, image url)] seen in its fetched parts
+    viewed = set()          # image urls already looked at with view_image
 
     max_steps = steps_for(effort)
     extensions = 0          # how many times the model has bought itself more room
@@ -1388,7 +1664,18 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                         obs = (f"Plan noted (free): {len(parts)} part(s), about "
                                f"{plan['expected']} research step(s) in all, of which "
                                f"{used} are used. ")
-                        if not todo:
+                        # The plan call is where a model decides it is done (both muse
+                        # runs: plan, then the answer) — so unviewed figures are named here,
+                        # and "write the answer now" waits until they have been weighed.
+                        unseen = [f for figs_ in page_figs.values() for f in figs_
+                                  if f[1] not in viewed]
+                        if unseen:
+                            obs += ("Pages you read have figures you have not looked at: " +
+                                    "; ".join(f"'{a}' ({u})" for a, u in unseen[:4]) +
+                                    ". If one carries a result your answer needs — for a "
+                                    "page summary, the page's key chart — view_image it "
+                                    "before writing. ")
+                        elif not todo:
                             obs += "Nothing left to research — write the FINAL ANSWER now. "
                         if open_know:
                             obs += ("Answer the 'know' parts yourself in the answer — no "
@@ -1441,11 +1728,34 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                         # a model inventing e.g. web_find gets a steer, not a bare KeyError
                         raise ValueError(f"unknown tool {tool!r} — the only tools are: "
                                          + ", ".join(list(TOOLS) + ["plan", "more_steps", "ask_user"]))
+                    viewer = None
                     if tool == "web_fetch":
                         url = str(args.get("url", ""))
                         part = fetch_parts.get(url, 0) + 1
                         result = web_fetch(url, part)
                         fetch_parts[url] = part
+                    elif tool == "view_image":
+                        url = str(args.get("url", "")).strip()
+                        question = str(args.get("question") or "")
+                        if model_has_vision(model):
+                            viewer = model        # it holds this turn already: no load
+                            result = view_image(url, question, viewer)
+                        else:
+                            viewer = VISION_MODEL
+                            yield {"type": "notice", "text": f"{model} can't see images — "
+                                                             f"{viewer} is reading this one"}
+                            with borrow(viewer) as (ok, why):
+                                if not ok:
+                                    raise UnusableSource(
+                                        f"Could not view the image: {why}. Work from the "
+                                        f"page text, and tell the user the figure at {url} "
+                                        f"was not read.")
+                                result = view_image(url, question, viewer)
+                        viewed.add(url)
+                        alt = next((f[0] for fs in page_figs.values() for f in fs
+                                    if f[1] == url), "")
+                        yield {"type": "figure", "url": url, "caption": alt or question[:120],
+                               "viewed": True, "by": viewer}
                     else:
                         result = TOOLS[tool](args)
                     if isinstance(result, list) and not result:
@@ -1455,12 +1765,45 @@ def research_events(model, messages, min_sources=MIN_SOURCES, effort=None, tempe
                     obs = format_observation(tool, result)
                     n = len(result) if isinstance(result, list) else 1
                     step_usable = True
+                    # A long page is read in parts; say which one, or a model paging
+                    # through a page looks like one re-reading it ("1 result(s)" x5).
+                    pm = (re.search(r"\(part (\d+) of (\d+)\)", result[:600])
+                          if tool == "web_fetch" else None)
+                    what = (f"part {pm[1]} of {pm[2]}" if pm else
+                            f"read by {viewer}" if viewer else f"{n} result(s)")
                     yield {"type": "observation", "tool": tool, "n": n, "ok": True,
-                           "preview": f"{n} result(s) in {time.time() - t0:.1f}s"}
+                           "preview": f"{what} in {time.time() - t0:.1f}s"}
                     if tool == "web_fetch":  # count it as a real source read
                         searches_in_a_row = 0
+                        # The system prompt alone did not do it: muse-glimmer summarised
+                        # the HF page with the KLD chart marker right in front of it and
+                        # never looked (2026-10-13). Say it where attention is.
+                        # A paged read defers: it notes the figure on part 1 and has
+                        # forgotten it by part 5 — so the last part repeats the page's
+                        # figures not yet viewed.
+                        figs = re.findall(r"\[image: (.+?) — (\S+?)(?:, \d+x\d+)?\]", result)
+                        # Every figure passed goes to the page's gallery too: when the model
+                        # doesn't look (it usually doesn't, on a summary), the user still can.
+                        for alt, src in figs:
+                            if all(src != f[1] for fs in page_figs.values() for f in fs):
+                                yield {"type": "figure", "url": src, "caption": alt,
+                                       "page": url, "viewed": False}
+                        page_figs.setdefault(url, []).extend(f for f in figs
+                                                             if f not in page_figs[url])
+                        last = not pm or pm[1] == pm[2]     # single-part page, or its end
+                        not_seen = [f for f in (page_figs[url] if last else figs)
+                                if f[1] not in viewed]
+                        if not_seen:
+                            obs += ("\n\nNOTE: " + ("this page has" if last else "this part has") +
+                                    (f" {len(not_seen)} images" if len(not_seen) > 1 else " an image") +
+                                    " the text cannot show, not viewed yet: " +
+                                    "; ".join(f"'{a}' ({u})" for a, u in not_seen[:4]) +
+                                    ". If one is a chart, plot, table or diagram that carries "
+                                    "a result this question needs — for a page summary, the "
+                                    "page's key figure — call view_image on it before "
+                                    "answering.")
                         dom = urllib.parse.urlparse(args.get("url", "")).netloc
-                        if dom:
+                        if dom and fetch_parts.get(url) == 1:   # list a page once, not per part
                             read_domains.add(dom)
                             yield {"type": "source", "url": args.get("url", "")}
                     elif isinstance(result, list):  # remember URLs we could fetch later
@@ -1629,6 +1972,10 @@ def run_agent(model, messages, min_sources=MIN_SOURCES, temperature=None):
             at_line_start = True
         elif t == "source":
             read += 1
+        elif t == "card":
+            newline()
+            sys.stdout.write(c(f"  ▣ {ev['source']}: {ev['title']} — {ev['url']}\n", C.cyan))
+            at_line_start = True
         elif t == "plan":
             newline()
             marks = {"done": "✓", "not_found": "✗"}
