@@ -436,7 +436,8 @@ def _names_title(title, question, qwords):
 # Question words around the subject: "what is a quill" names the article "quill".
 _ASK_WORDS = set("""what whats who whom whose which is are was were be a an the of do does did
 tell me about explain define definition meaning means describe please can could would you
-your i we my know give brief overview summary on for to in and or any some""".split())
+your i we my know give brief overview summary on for to in and or any some
+something anything little bit things stuff facts quick interesting""".split())
 _ZH_ASK = re.compile(r"(什么是|是什么|是谁|是什麼|什麼是|介绍一下|介紹一下|请问|請問|的意思|吗|嗎|呢|[？?。！!，,])")
 _CARD_CACHE = {}
 
@@ -671,12 +672,10 @@ TOOL_SPECS = [
     {"type": "function", "function": {
         "name": "ask_user",
         "description": (
-            "Ask the user which thing they mean, when their words fit several different "
-            "things (shows, films, products, people, versions) and the answers differ. "
-            "Search first so the options are real, and give each option its short answer "
-            "when you have it — then asking costs the user nothing: they see every answer "
-            "and pick the one they meant. This ENDS your turn. A question with one obvious "
-            "meaning gets a plain answer instead."),
+            "Ask the user which thing they mean, when they point at one specific thing "
+            "('the X show', 'that film') and several real ones fit about equally. Give "
+            "each option its short answer when you have it. This ENDS your turn. A plain "
+            "topic or famous name is not ambiguous: answer its main meaning instead."),
         "parameters": {"type": "object", "properties": {
             "question": {"type": "string",
                          "description": "one short question, e.g. 'Which one did you mean?'"},
@@ -791,11 +790,13 @@ def date_stamp():
 # "cannot tell" — it picks the popular reading and feels sure. So the reminder rides
 # on the question too, worded on what the words COULD mean rather than on whether
 # the model feels unsure.
-ASK_BACK_STAMP = ("\n[if these words could point at more than one thing — several "
-                  "shows, films, products or people fit them — search to find the real "
-                  "candidates, then call ask_user even if one is more popular: describe "
-                  "each option by what the user would recognise, not only its name, and "
-                  "give each its short answer; one obvious meaning just gets the answer]")
+# Worded too broadly it overcorrected: "Tell me something about Prometheus" got six
+# searches and a five-way menu instead of the myth. So it now asks only when the
+# user points at ONE specific thing they can't name, and a plain topic gets answered.
+ASK_BACK_STAMP = ("\n[if the user points at one specific thing ('the X show', 'that "
+                  "film') and several real ones fit, call ask_user; a plain topic or "
+                  "famous name gets its main meaning answered, with at most one line "
+                  "naming other meanings]")
 
 
 def stamp_current_question(messages):
@@ -938,22 +939,16 @@ RULES:
   finding, not a cue for a third rephrasing: it may not be published in that
   form. Mark the part not_found, say so plainly in the answer, and give the
   nearest thing that IS published — never fill the gap from memory.
-- When a question could mean more than one thing (several shows, products,
-  people or versions fit the words), do not silently pick one. Find out what
-  the candidates ARE: search the subject broadly (a person's whole career, a
-  product's whole line-up), not only the one reading you guessed. Then lead
-  with the reading that matches the user's exact words most literally, and
-  give each other plausible reading a line of its own. A candidate your
-  research turned up belongs in the answer, not only in your reasoning — the
-  user cannot see what you weighed and dropped.
-- If your research shows more than one plausible reading, call ask_user
-  instead of answering — even when one reading is more popular, because the
-  user may mean the other. Describe each option by what the user would
-  recognise — the format, who was in it, the setting, the years — not just its
-  title (people often ask because they forgot the name), and give each its
-  short answer, so asking costs them nothing. Never claim to know what they
-  meant ("the show you're thinking of", "most likely you mean") when you are
-  guessing. A question with one obvious meaning gets a plain answer.
+- Most words have a main meaning: a plain topic or a famous name ("tell me
+  about Prometheus", "what is Python") gets that meaning answered straight
+  away. Do not search the other meanings; at most add one closing line naming
+  them ("If you meant the software or the film, say so").
+- Ask only when the user points at ONE specific thing they cannot name ("the
+  Jeremy Clarkson show", "that Steve Jobs movie") and several real ones fit
+  about equally. Then call ask_user: describe each option by what the user
+  would recognise — the format, who was in it, the setting, the years — and
+  give each its short answer if you have it. Never claim to know what they
+  meant ("the show you're thinking of") when you are guessing.
 - Running out of steps because your sources let you down is not a reason to give
   a thin answer. If the pages you fetched were paywalled, off-topic, or simply
   wrong, and you know what to try instead, call more_steps and say what you will
@@ -1051,22 +1046,16 @@ RULES:
   finding, not a cue for a third rephrasing: it may not be published in that
   form. Mark the part not_found, say so plainly in the answer, and give the
   nearest thing that IS published — never fill the gap from memory.
-- When a question could mean more than one thing (several shows, products,
-  people or versions fit the words), do not silently pick one. Find out what
-  the candidates ARE: search the subject broadly (a person's whole career, a
-  product's whole line-up), not only the one reading you guessed. Then lead
-  with the reading that matches the user's exact words most literally, and
-  give each other plausible reading a line of its own. A candidate your
-  research turned up belongs in the answer, not only in your reasoning — the
-  user cannot see what you weighed and dropped.
-- If your research shows more than one plausible reading, call ask_user
-  instead of answering — even when one reading is more popular, because the
-  user may mean the other. Describe each option by what the user would
-  recognise — the format, who was in it, the setting, the years — not just its
-  title (people often ask because they forgot the name), and give each its
-  short answer, so asking costs them nothing. Never claim to know what they
-  meant ("the show you're thinking of", "most likely you mean") when you are
-  guessing. A question with one obvious meaning gets a plain answer.
+- Most words have a main meaning: a plain topic or a famous name ("tell me
+  about Prometheus", "what is Python") gets that meaning answered straight
+  away. Do not search the other meanings; at most add one closing line naming
+  them ("If you meant the software or the film, say so").
+- Ask only when the user points at ONE specific thing they cannot name ("the
+  Jeremy Clarkson show", "that Steve Jobs movie") and several real ones fit
+  about equally. Then call ask_user: describe each option by what the user
+  would recognise — the format, who was in it, the setting, the years — and
+  give each its short answer if you have it. Never claim to know what they
+  meant ("the show you're thinking of") when you are guessing.
 - Running out of steps because your sources let you down is not a reason to give
   a thin answer. If the pages you fetched were paywalled, off-topic, or simply
   wrong, and you know what to try instead, call more_steps and say what you will
